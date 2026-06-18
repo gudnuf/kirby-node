@@ -1,0 +1,16 @@
+[package]
+name = "kirby-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The genome to daemon gateway contract (spec 3.1 and 3.2). Both the daemon
+# (server) and the genome (client) depend on this crate so the wire shape has a
+# single source of truth and the schema_version stays consistent.
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

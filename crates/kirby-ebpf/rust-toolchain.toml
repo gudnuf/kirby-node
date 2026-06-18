@@ -1,0 +1,12 @@
+# The eBPF kernel program is built with NIGHTLY (the bpfel-unknown-none target is
+# tier 3 and needs build-std, which is nightly-only). This nested toolchain file
+# overrides the repo-root stable pin for this subtree only, so the daemon stays
+# on stable 1.90. The date is pinned so the BPF object (and thus the daemon
+# binary that embeds it) is reproducible (gate G10). rust-src is required for
+# build-std.
+[toolchain]
+channel = "nightly-2025-09-01"
+components = ["rust-src"]
+# bpfel-unknown-none is tier 3 with no prebuilt std; build-std (the crate's
+# .cargo/config.toml) produces it from rust-src, so the target is NOT listed
+# here (rustup would fail to resolve a std component for it).

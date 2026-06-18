@@ -1,0 +1,38 @@
+# The kernel-side eBPF program (spec 3.3, D-7): a TC classifier on the VM's TAP
+# that counts egress bytes per packet into a one-slot array map the daemon reads
+# to bill the treasury. It is a SEPARATE workspace (its own [workspace] below)
+# built for the bpfel-unknown-none target with its own nightly toolchain
+# (rust-toolchain.toml here), so the daemon stays on stable. The daemon's
+# build.rs (aya-build) compiles this and embeds the object; the userspace loader
+# lives in kirby-node (meter_egress.rs).
+[package]
+name = "kirby-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+# aya-ebpf is the kernel-side eBPF runtime (pure Rust, no libbpf). Pinned: the
+# 0.1.x line is pre-1.0 and churns (spec section 11).
+aya-ebpf = "=0.1.1"
+
+[[bin]]
+name = "kirby-egress"
+path = "src/main.rs"
+
+# A standalone release profile so the BPF object is optimized and aborts on
+# panic (the verifier rejects an unwinding eBPF program). NO lto: link-time
+# optimization rearranges the BPF object's sections in a way aya 0.13.1's loader
+# cannot parse ("error parsing ELF data"); a single-function classifier does not
+# need it anyway.
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+overflow-checks = false
+
+# Separate from the daemon workspace: this crate is built for a different target
+# (bpfel-unknown-none) with a different (nightly) toolchain, so it must not be a
+# member of the root workspace.
+[workspace]

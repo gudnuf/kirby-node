@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+# The genome (C-2) is a static musl binary, so the musl target is provisioned
+# here too. The daemon builds for the host gnu target.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]

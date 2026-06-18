@@ -1,0 +1,24 @@
+[package]
+name = "kirby-genome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The musl-Rust stub genome that runs inside the microVM (spec 3.6). Deps stay
+# deliberately lean so the static musl binary stays small. C-2 adds the vsock
+# client path the genome uses to reach the daemon gateway at boot (spec 3.1):
+# tokio-vsock (the AF_VSOCK stream to the host, tonic012 feature matches tonic
+# 0.12), plus tower and hyper-util for the tonic connector glue. The metering
+# workload (C-4), the brokered act (C-6), and the entropy re-derive (C-8) add
+# their pieces in those chunks.
+[dependencies]
+kirby-proto = { path = "../kirby-proto" }
+tonic.workspace = true
+prost.workspace = true
+tokio = { version = "1.43", features = ["rt", "macros", "net", "io-util", "time"] }
+tokio-vsock = { version = "0.7.2", features = ["tonic012"] }
+tower = { version = "0.4", features = ["util"] }
+hyper-util = "0.1"
+# Raw mount syscall for /proc and /sys (the genome is PID 1 with no init system).
+libc = "0.2"

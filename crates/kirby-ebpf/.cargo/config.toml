@@ -1,0 +1,13 @@
+# Build this crate for the little-endian BPF target with build-std of core (the
+# BPF target is tier 3, so std is built from source). --btf emits BTF so aya can
+# load the program with CO-RE relocations against the host kernel's
+# /sys/kernel/btf/vmlinux. The daemon's build.rs (aya-build) invokes cargo here
+# under the nightly toolchain pinned by this crate's rust-toolchain.toml.
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+rustflags = ["-C", "link-arg=--btf"]

@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package kirby.gateway.v1;
+
+// The genome's only interface to the outside world. Every method is a
+// daemon-mediated choke point (spec 3.1). The genome is the gRPC client, the
+// daemon is the server, listening on a vsock port bound to that VM's CID. One
+// genome cannot reach another's daemon (distinct CIDs per VM).
+service NodeGateway {
+  // boot: the genome pulls its non-secret session context (task descriptor,
+  // budget snapshot, mint and endpoint identifiers). Never credentials.
+  rpc GetSessionContext(SessionRequest) returns (SessionContext);
+
+  // entropy: the resume gate. Returns a fresh per-call nonce the genome MUST
+  // mix into any ephemeral secret (spec 3.4).
+  rpc GetEntropyNonce(EntropyRequest) returns (EntropyNonce);
+
+  // metering: the genome self-reports app-level events. Host metering via
+  // cgroups and eBPF is authoritative; this is supplementary and diagnostic
+  // only and is never trusted for billing (spec 3.3).
+  rpc ReportEvent(Event) returns (Ack);
+
+  // agency: the brokered-act path. request, then the daemon authorizes against
+  // the treasury and meters, then the daemon performs, then a receipt
+  // (spec 3.2).
+  rpc RequestCapability(CapabilityRequest) returns (CapabilityReceipt);
+}
+
+// All messages carry schema_version (starts at 1, additive-only thereafter).
+
+message SessionRequest {
+  uint32 schema_version = 1;
+}
+
+message SessionContext {
+  uint32 schema_version = 1;
+  string task_descriptor = 2;   // what the stub genome should do this session
+  uint64 budget_sats = 3;       // budget snapshot, non-secret
+  repeated string allowlisted_destinations = 4; // mint ids and endpoint hosts, non-secret
+}
+
+message EntropyRequest {
+  uint32 schema_version = 1;
+}
+
+message EntropyNonce {
+  uint32 schema_version = 1;
+  bytes nonce = 2;              // fresh 32 bytes from the host CSPRNG
+  uint64 vm_generation = 3;     // current VMGenID generation; bumps on restore
+}
+
+message Event {
+  uint32 schema_version = 1;
+  string kind = 2;             // e.g. "hello", "fingerprint", "raw_egress_attempt"
+  string detail = 3;           // free-form diagnostic payload
+}
+
+message Ack {
+  uint32 schema_version = 1;
+}
+
+// The capability and treasury-gateway contract (spec 3.2), the load-bearing
+// agency surface: request, then authorize, then meter, then perform.
+
+message PayInvoice {
+  string bolt11 = 1;
+  uint64 max_fee_sats = 2;
+}
+
+message SettleEcash {
+  string mint_id = 1;
+  uint64 amount = 2;
+  string recipient_or_quote = 3;
+}
+
+message PaidHttp {
+  string method = 1;
+  string url = 2;
+  bytes body = 3;
+  uint64 max_cost_sats = 4;    // covers a generic paid service or L402
+}
+
+message CapabilityRequest {
+  uint32 schema_version = 1;
+  string idempotency_key = 2;  // genome-chosen; the daemon dedupes on it (replay safety across a resume)
+  oneof act {
+    PayInvoice  pay_invoice  = 3;
+    SettleEcash settle_ecash = 4;
+    PaidHttp    paid_http    = 5;
+  }
+  uint64 budget_sats = 6;      // max the genome authorizes for THIS act; must be <= remaining treasury
+}
+
+// The daemon enforces a fixed order, host-side, for every RequestCapability:
+// first dedupe on idempotency_key, then allowlist the destination, then the
+// budget gate (estimate <= budget_sats AND estimate <= treasury_remaining),
+// then perform with the host-held rail credential the genome never sees, then
+// meter and debit the actual cost atomically with recording the receipt. The
+// actual spend is capped at the estimate so the invariant actual <= estimate <=
+// treasury_remaining holds even after perform (spec D-20).
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  AUTHORIZED_AND_PERFORMED = 1;
+  DENIED_INSUFFICIENT_TREASURY = 2;
+  DENIED_OVER_BUDGET = 3;
+  DENIED_NOT_ALLOWLISTED = 4;
+  UPSTREAM_FAILED = 5;
+  DUPLICATE_IGNORED = 6;
+  // The node is not the active lease-holder at the current committed term, so it
+  // is term-fenced from debiting the treasury (spec 3.5, 4.3, D-4, gate G8): only
+  // the node that is BOTH the Raft leader AND holds active_lease at the current
+  // term may run and debit. A revived stale node, or any non-active node, gets
+  // this and debits 0. Additive (field 7), so the wire stays compatible.
+  DENIED_NOT_ACTIVE_LEASE = 7;
+}
+
+message CapabilityReceipt {
+  uint32 schema_version = 1;
+  Outcome outcome = 2;
+  uint64 cost_sats = 3;          // actual metered cost debited (0 on any DENIED)
+  uint64 treasury_remaining = 4; // authoritative post-debit balance, daemon-owned
+  bytes proof = 5;               // opaque act receipt (ecash proof, LN preimage, or HTTP status and body hash)
+}

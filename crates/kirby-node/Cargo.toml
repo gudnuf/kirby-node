@@ -1,0 +1,122 @@
+[package]
+name = "kirby-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The node daemon: one Tokio process per node (spec 5). C-1 shipped the skeleton
+# and the host-prereqs gate. C-3 added the vsock gateway server plus the
+# persisted treasury: tonic and prost (the gRPC service), tokio-vsock (the vsock
+# transport, tonic012 feature matches tonic 0.12), sled (the persisted treasury
+# counter and dedupe ledger, spec 3.2 / 4.2), and rand (the GetEntropyNonce host
+# CSPRNG, spec 3.4). C-2 adds fctools (it drives Firecracker plus the jailer, the
+# untrusted-genome boundary, spec D-7) with the jailed executor, the sudo
+# elevation spawner (the locked launch path), and the tokio runtime backend, on
+# the nix syscall backend. C-4 adds cgroups-rs (read the VM cgroup cpu.stat +
+# memory.current to bill the treasury) and libc (the cgroup-based VMM kill for
+# the budget-death halt). The eBPF egress-byte meter (aya) is DEFERRED to C-5:
+# it rides with the per-VM TAP, which does not exist yet. The nftables egress
+# (C-5), the real rail (C-6), and the openraft lease (C-9) add their deps in
+# those chunks, to keep each tree clippy-clean with no unused crates.
+[dependencies]
+kirby-proto = { path = "../kirby-proto" }
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tokio-vsock = { version = "0.7.2", features = ["tonic012"] }
+sled = "0.34"
+rand = "0.9"
+# async-trait: the SandboxBackend / SandboxInstance seam is dyn-dispatched (the
+# daemon holds a `Box<dyn SandboxInstance>` and a backend trait object so a second
+# backend can slot in), and dyn-compatible async trait methods need boxed futures.
+# Already in the dependency graph via tonic; declared here as a direct dep.
+async-trait = "0.1"
+# fctools drives Firecracker plus the jailer (spec D-7). Pinned exactly: it is a
+# pre-1.0 alpha that churns (spec section 11). Features: the VM layer plus the
+# jailed executor (the jailer is the security boundary), the elevation spawners
+# (the daemon launches the jailer via sudo, the locked decision), the tokio
+# runtime, and the nix syscall backend (a binary must choose one).
+fctools = { version = "=0.7.0-alpha.2", default-features = false, features = [
+    "tokio-runtime",
+    "vm",
+    "jailed-vmm-executor",
+    "elevation-process-spawners",
+    "nix-syscall-backend",
+] }
+# tokio-stream wraps the Unix listener as a Stream for tonic's
+# serve_with_incoming (the Firecracker vsock host socket, spec 3.1).
+tokio-stream = { version = "0.1", features = ["net"] }
+# futures: read the guest serial console (an AsyncRead pipe from fctools) line by
+# line for the boot log.
+futures = "0.3"
+# cgroups-rs reads the VM's cgroup v2 cpu.stat (usage_usec) and memory.current to
+# bill the treasury on a tick (spec 3.3, D-7, the C-4 meter). libc is the raw
+# kill(2) for the daemon-initiated VMM kill via the VM's cgroup.procs (fctools'
+# sudo-tracked process handle reaches only the sudo process, not the firecracker
+# it launches, so the budget-death halt kills the firecracker directly).
+cgroups-rs = "0.5"
+libc = "0.2"
+# aya is the userspace side of the eBPF egress-byte meter (spec 3.3, D-7, the
+# C-5 meter, gate G4). It loads the kernel program built by build.rs from the
+# kirby-ebpf crate, attaches it to the VM TAP's clsact ingress hook (the VM-egress direction), and reads the
+# per-byte counter map on a tick. Pinned: the 0.13 line is pre-1.0 and churns
+# (spec section 11). The kernel program object is embedded by build.rs and loaded
+# from memory, so aya needs no extra features.
+aya = "=0.13.1"
+# The CDK ecash stack for the C-6 brokered act (gate G5, D-16). The real rail
+# (CdkEcashRail) holds a funded cdk Wallet (the host-only credential the genome
+# never sees) and settles ecash by melting against the LOCAL fakewallet mint over
+# HOST networking. cdk = the Wallet + melt API; cdk-sqlite = the wallet's
+# in-memory store; cdk-fake-wallet = create_fake_invoice (the fake BOLT11 the melt
+# pays so the mint marks it Paid and returns a preimage = the real receipt, D-18).
+# The wallet seed is drawn from the host CSPRNG (rand, already a dep). The mint is
+# BOOTED in the G5 test (cdk-mintd, a dev-dependency). The credential lives only
+# host-side; nothing CDK crosses vsock.
+cdk = { workspace = true }
+cdk-sqlite = { workspace = true }
+cdk-fake-wallet = { workspace = true }
+# openraft is the embedded Raft under the lease + no-split-brain (spec 3.5, 4.3,
+# D-4, D-17, gate G8): each node runs an openraft engine, the single replicated
+# value is active_lease{node_id, term}, and the inter-node transport is openraft
+# over plain loopback TCP (no iroh). Only the leader+lease-holder runs+debits; a
+# revived stale node is term-fenced. Pinned exactly (pre-1.0, churns, spec section
+# 11). It is daemon-side; nothing openraft crosses vsock or touches the genome.
+openraft = { workspace = true }
+# bincode is unused; the loopback RPC wire uses serde_json (already a dep) for the
+# Raft RPCs, keeping the transport dependency-light.
+# nostr-sdk is the host-side Nostr client for the "nerve" presence/discovery layer
+# (slice 1): the daemon publishes a replaceable presence beacon and subscribes to
+# the fleet over a relay (an outbound websocket, the same host-network path as the
+# C-6 daemon->mint HTTP). It is daemon-side and UNPRIVILEGED (no sudo, no jailer),
+# never crosses vsock, and never touches the genome. default-features = false keeps
+# it lean: presence needs only the core (custom Kind, EventBuilder, Filter, Keys,
+# subscriptions, NIP-19 bech32), none of the optional NIPs/tor (default = []). It
+# brings its own consistent secp256k1/tokio-tungstenite/reqwest, so it is NOT
+# coupled to cdk's transitive versions.
+nostr-sdk = { version = "0.44", default-features = false }
+
+[[bin]]
+name = "kirby-node"
+path = "src/main.rs"
+
+# Dev-only: the in-process tonic client/server test (no microVM) drives the
+# gateway over a duplex stream. tower (service_fn connector) and hyper-util
+# (TokioIo) match tonic 0.12's transport. These are test-only and do not enter
+# the daemon. (tokio-stream is now a regular dependency, used by the Firecracker
+# vsock serve path.)
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+hyper-util = "0.1"
+# cdk-mintd boots a REAL local fakewallet mint (a cdk-mintd HTTP mint with the
+# cdk-fake-wallet Lightning backend) in the G5 test (tests/brokered_act.rs). It is
+# TEST-ONLY (the daemon never embeds a mint); only the fakewallet + sqlite
+# features, to keep the cln/lnd/ldk/bitcoind backends out of the build.
+cdk-mintd = { workspace = true }
