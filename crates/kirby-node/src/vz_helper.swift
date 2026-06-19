@@ -28,6 +28,8 @@ private struct HelperArgs {
     let cpuCount: Int
     let memoryMib: UInt64
     let workload: String?
+    // Hidden diagnostic hook for the VZ dead-fd probe. Normal boots leave this nil.
+    let probeStopVmAfterReadyMs: Int?
 
     static func parse(_ argv: [String]) -> HelperArgs {
         var values: [String: String] = [:]
@@ -62,7 +64,8 @@ private struct HelperArgs {
             gatewayPort: gatewayPort,
             cpuCount: cpuCount,
             memoryMib: memoryMib,
-            workload: values["workload"]
+            workload: values["workload"],
+            probeStopVmAfterReadyMs: values["probe-stop-vm-after-ready-ms"].flatMap(Int.init)
         )
     }
 }
@@ -283,13 +286,20 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
     private let vm: VZVirtualMachine
     private let bridge: SocketBridge
     private let gatewayPort: UInt32
+    private let probeStopVmAfterReadyMs: Int?
     private var listener: VZVirtioSocketListener?
     private var stopping = false
 
-    init(vm: VZVirtualMachine, bridge: SocketBridge, gatewayPort: UInt32) {
+    init(
+        vm: VZVirtualMachine,
+        bridge: SocketBridge,
+        gatewayPort: UInt32,
+        probeStopVmAfterReadyMs: Int?
+    ) {
         self.vm = vm
         self.bridge = bridge
         self.gatewayPort = gatewayPort
+        self.probeStopVmAfterReadyMs = probeStopVmAfterReadyMs
         super.init()
     }
 
@@ -310,6 +320,27 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
             stderrLine(
                 "KIRBY_VZ_READY pid=\(getpid()) port=\(self.gatewayPort) state=\(self.vm.state.rawValue)"
             )
+            if let ms = self.probeStopVmAfterReadyMs {
+                stderrLine("KIRBY_VZ_PROBE_STOP_VM_SCHEDULED after_ready_ms=\(ms)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) {
+                    self.probeStopVmAndKeepHelperAlive()
+                }
+            }
+        }
+    }
+
+    func probeStopVmAndKeepHelperAlive() {
+        stderrLine("KIRBY_VZ_PROBE_STOP_VM_BEGIN state=\(vm.state.rawValue)")
+        guard vm.canStop else {
+            stderrLine("KIRBY_VZ_PROBE_STOP_VM_SKIPPED can_stop=false state=\(vm.state.rawValue)")
+            return
+        }
+        vm.stop { error in
+            if let error {
+                stderrLine("KIRBY_VZ_PROBE_STOP_VM_ERROR \(error)")
+            } else {
+                stderrLine("KIRBY_VZ_PROBE_STOP_VM_DONE state=\(self.vm.state.rawValue)")
+            }
         }
     }
 
@@ -333,11 +364,17 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         stderrLine("KIRBY_VZ_GUEST_STOPPED")
+        if probeStopVmAfterReadyMs != nil {
+            return
+        }
         stopAndExit(code: 0)
     }
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         stderrLine("KIRBY_VZ_STOPPED_WITH_ERROR \(error)")
+        if probeStopVmAfterReadyMs != nil {
+            return
+        }
         stopAndExit(code: 1)
     }
 }
@@ -420,7 +457,12 @@ private let parentPid = getppid()
 private let bridge = SocketBridge(udsPath: args.uds)
 private let config = makeConfiguration(args: args)
 private let vm = VZVirtualMachine(configuration: config)
-private let controller = VmController(vm: vm, bridge: bridge, gatewayPort: args.gatewayPort)
+private let controller = VmController(
+    vm: vm,
+    bridge: bridge,
+    gatewayPort: args.gatewayPort,
+    probeStopVmAfterReadyMs: args.probeStopVmAfterReadyMs
+)
 vm.delegate = controller
 installSignalHandlers(controller: controller, parentPid: parentPid)
 controller.start()

@@ -100,6 +100,12 @@ impl SandboxBackend for VzBackend {
         if let Some(workload) = &spec.workload {
             command.arg("--workload").arg(workload);
         }
+        // Disabled by default. Used by the VERIFY-ON-MAC FIX-3 probe to stop the
+        // VM while keeping the helper alive, so framework-fd death can be
+        // distinguished from helper-process death.
+        if let Ok(ms) = std::env::var("KIRBY_VZ_PROBE_STOP_VM_AFTER_READY_MS") {
+            command.arg("--probe-stop-vm-after-ready-ms").arg(ms);
+        }
 
         tracing::info!(
             helper = %helper.display(),
