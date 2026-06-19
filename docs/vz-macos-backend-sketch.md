@@ -57,13 +57,14 @@ mechanics differ. Work items, roughly sequenced:
    nix-darwin `nix.linux-builder`. See the README ("Getting the arm64 genome image on
    macOS"). Boot (item 2) needs this in hand.
 
-1. FFI shim (the platform-engineering long pole): there is no production Rust
-   VZ.framework crate, so an objc2 layer or a small Swift/Go helper drives
-   VZVirtualMachine. Decide objc2-in-process vs a sidecar Swift helper the daemon drives.
-   Budget real time here; this is the macOS-specific cost.
-2. Boot (macOS G1): VZLinuxBootLoader + the SAME content-addressed squashfs + static-musl
-   /init genome image (the image is portable; only the loader differs). Prove a Linux
-   microVM boots headless.
+1. Swift sidecar helper (the platform-engineering long pole): there is no production Rust
+   VZ.framework crate, so the daemon drives a small Swift helper that owns
+   VZVirtualMachine. This is resolved as sidecar Swift, not objc2-in-process. Budget real
+   time here; this is the macOS-specific cost.
+2. Boot (macOS G1): VZLinuxBootLoader + a raw arm64 `Image` derived from the shipped
+   `vmlinux` ELF + the SAME content-addressed squashfs + static-musl /init genome image
+   (the image is portable; only the loader differs). Prove a Linux microVM boots
+   headless.
 3. vsock host-gateway shim: the guest side is identical (the genome dials vsock), but the
    HOST side is NOT raw AF_VSOCK on macOS (ENODEV); it is VZVirtioSocketConnection via the
    framework. So the daemon's gateway transport gets a VZ-specific listener that serves the

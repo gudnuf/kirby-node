@@ -108,9 +108,9 @@ M4 Max manually until a self-hosted Mac runner exists (section 6).
     objects, keep accepting fresh connections, and apply a read-deadline or
     peer-close guard so a dead guest cannot wedge the bridge.
 
-- **VZ-2 (boot, macOS G1):** `VZLinuxBootLoader` + the uncompressed `vmlinux` ELF +
-  the same squashfs genome image. Gate G1: the Linux genome microVM boots headless on
-  the Mac and the genome process starts.
+- **VZ-2 (boot, macOS G1):** `VZLinuxBootLoader` + the raw arm64 `Image` derived from
+  the shipped `vmlinux` ELF + the same squashfs genome image. Gate G1: the Linux genome
+  microVM boots headless on the Mac and the genome process starts.
 
 - **VZ-3 (vsock helper bridge):** the guest side is identical (genome dials
   AF_VSOCK); the helper owns `VZVirtioSocketDevice` / `VZVirtioSocketConnection`
@@ -156,9 +156,10 @@ Both are boot-confirm items the design flags as MUST-verify on real VZ, not assu
    Baseline for the A/B: Firecracker's host uds appears to EOF promptly (inferred from
    reliable spike failover); ideally probe the uds directly rather than leaving it
    inferred.
-2. **Console + arch boot:** the arm64 guest kernel uses PL011 console + GIC v3;
-   confirm the `VZLinuxBootLoader` + vmlinux path boots clean on the actual framework
-   version (macOS 26 on the M4 Max).
+2. **Console + arch boot:** the arm64 guest kernel uses PL011 console + GIC v3; VZ
+   consumes a raw arm64 `Image`, so the backend derives that from the shipped ELF
+   `vmlinux`. Confirm the `VZLinuxBootLoader` + raw `Image` path boots clean on the
+   actual framework version (macOS 26 on the M4 Max).
 
 ## 6. Resolved decisions (open questions, now answered by the operator's direction)
 
