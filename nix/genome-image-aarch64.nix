@@ -183,15 +183,16 @@ let
         -no-progress
     '';
 
-  # The kernel image VZ boots is the uncompressed vmlinux ELF (VZ's
-  # VZLinuxBootLoader consumes an uncompressed kernel, NOT a raw arm64 `Image`).
-  # nixpkgs installs the uncompressed vmlinux into the kernel's dev output for
-  # every arch when CONFIG_MODULES=y (build.nix `cp vmlinux $dev/`); module
-  # support stays enabled (see the kernel file), so this path exists on aarch64
-  # exactly as on x86. The dev output's vmlinux carries debug info; the image
-  # build strips it (a stripped guest kernel, spec 3.6) so the image is small.
-  # strip removes only the symbol and debug sections; the PT_LOAD segments the
-  # boot loader uses are untouched.
+  # The image output carries the uncompressed vmlinux ELF. VZLinuxBootLoader
+  # actually boots a raw arm64 `Image`; the macOS backend derives that from the
+  # ELF PT_LOAD segments at boot until this derivation exports Image directly.
+  # nixpkgs installs vmlinux into the kernel's dev output for every arch when
+  # CONFIG_MODULES=y (build.nix `cp vmlinux $dev/`); module support stays enabled
+  # (see the kernel file), so this path exists on aarch64 exactly as on x86. The
+  # dev output's vmlinux carries debug info; the image build strips it (a stripped
+  # guest kernel, spec 3.6) so the image is small. strip removes only the symbol
+  # and debug sections; the PT_LOAD segments the backend conversion uses are
+  # untouched.
   vmlinux = "${kernel.dev}/vmlinux";
 
 in

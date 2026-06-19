@@ -19,6 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        build_vz_helper();
+        println!("cargo:rerun-if-env-changed=KIRBY_EBPF_CARGO");
+        return;
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         println!("cargo:rerun-if-env-changed=KIRBY_EBPF_CARGO");
         return;
@@ -117,4 +123,96 @@ fn main() {
         "cargo:rustc-env=KIRBY_EGRESS_BPF_OBJECT={}",
         object.display()
     );
+}
+
+fn build_vz_helper() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let helper_src = manifest_dir.join("src/vz_helper.swift");
+    let entitlements = manifest_dir.join("src/vz_helper.entitlements");
+    let helper_bin = out_dir.join("kirby-vz-helper");
+    let swiftc = xcrun_output(&["--sdk", "macosx", "--find", "swiftc"]);
+    let sdk = xcrun_output(&["--sdk", "macosx", "--show-sdk-path"]);
+
+    println!("cargo:rerun-if-changed={}", helper_src.display());
+    println!("cargo:rerun-if-changed={}", entitlements.display());
+
+    let mut swift = Command::new(swiftc.trim());
+    strip_nix_darwin_sdk_env(&mut swift);
+    let status = swift
+        .arg(&helper_src)
+        .arg("-o")
+        .arg(&helper_bin)
+        .arg("-sdk")
+        .arg(sdk.trim())
+        .arg("-framework")
+        .arg("Virtualization")
+        .status()
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to invoke swiftc for the macOS VZ helper: {e}. \
+                 Install Xcode or the command line tools and rerun `kirby-node prereqs`."
+            )
+        });
+    assert!(
+        status.success(),
+        "swiftc failed to build the macOS VZ helper at {}",
+        helper_src.display()
+    );
+
+    let mut codesign = Command::new("/usr/bin/codesign");
+    strip_nix_darwin_sdk_env(&mut codesign);
+    let status = codesign
+        .args(["--force", "--sign", "-"])
+        .arg("--entitlements")
+        .arg(&entitlements)
+        .arg(&helper_bin)
+        .status()
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to invoke codesign for the macOS VZ helper: {e}. \
+                 Install Xcode or the command line tools and rerun `kirby-node prereqs`."
+            )
+        });
+    assert!(
+        status.success(),
+        "codesign failed to sign the macOS VZ helper at {} with {}",
+        helper_bin.display(),
+        entitlements.display()
+    );
+
+    println!("cargo:rustc-env=KIRBY_VZ_HELPER={}", helper_bin.display());
+}
+
+fn xcrun_output(args: &[&str]) -> String {
+    let mut command = Command::new("/usr/bin/xcrun");
+    strip_nix_darwin_sdk_env(&mut command);
+    let output = command
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to invoke /usr/bin/xcrun {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "/usr/bin/xcrun {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|e| panic!("/usr/bin/xcrun {args:?} returned non-UTF8 output: {e}"))
+}
+
+fn strip_nix_darwin_sdk_env(command: &mut Command) {
+    // The dev shell uses Nix's Darwin SDK for Rust/C builds. Xcode's Swift
+    // compiler must instead see its matching Xcode SDK; otherwise swiftc tries
+    // to load the Nix SDK's Swift modules and fails with a SwiftShims/version
+    // mismatch. Remove the Nix SDK selectors for helper build/sign commands.
+    for key in [
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "NIX_CFLAGS_COMPILE",
+        "NIX_CFLAGS_COMPILE_FOR_BUILD",
+        "NIX_LDFLAGS",
+        "NIX_LDFLAGS_FOR_BUILD",
+    ] {
+        command.env_remove(key);
+    }
 }

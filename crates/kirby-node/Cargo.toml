@@ -101,6 +101,12 @@ libc = "0.2"
 # kirby-ebpf crate and attaches it to the VM TAP.
 aya = "=0.13.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# libc is used only for SIGTERM delivery to the Swift VZ helper. The helper owns
+# VZVirtualMachine and stops the guest on SIGTERM; Rust remains the daemon
+# authority that decides when to halt.
+libc = "0.2"
+
 [[bin]]
 name = "kirby-node"
 path = "src/main.rs"

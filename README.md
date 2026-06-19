@@ -166,8 +166,8 @@ Virtualization.framework (VZ) to run the same Linux genome image on Apple Silico
   per-instance struct that owns the running guest's host state.
 - **The arm64 genome image:** `nix/genome-image-aarch64.nix` (squashfs + static-musl
   /init) and `nix/guest-kernel-aarch64.nix` (stripped Linux 6.1 LTS, PL011 console, GIC
-  v3). VZ uses `VZLinuxBootLoader` with the uncompressed `vmlinux` ELF; the squashfs is
-  the same format as x86.
+  v3). The image ships `vmlinux`; the VZ backend derives the raw arm64 `Image` that
+  `VZLinuxBootLoader` boots. The squashfs is the same format as x86.
 - **Design docs:**
   - `docs/cross-platform-sandbox.md` -- backend assessment, parity map, known caveats
   - `docs/vz-macos-backend-sketch.md` -- build plan (FFI shim, boot, vsock shim, egress,
@@ -202,7 +202,7 @@ The image is content-addressed, so the store path is identical however it was pr
 
 | Item | Firecracker equivalent | VZ approach |
 |------|----------------------|-------------|
-| Boot | `fctools` + jailer | `VZLinuxBootLoader` + `VZVirtualMachine` (via objc2 FFI or a Swift shim) |
+| Boot | `fctools` + jailer | `VZLinuxBootLoader` + `VZVirtualMachine` through the Swift sidecar helper; backend converts ELF `vmlinux` to raw arm64 `Image` |
 | vsock host-side | Firecracker Unix socket per CID: `GatewayTransport::FirecrackerVsockUds` | `VZVirtioSocketDevice` / `VZVirtioSocketConnection`: add a `GatewayTransport::VzVsock` variant; the gateway service itself is unchanged |
 | Egress lockdown | TAP + nftables default-deny + eBPF byte counter | vmnet interface + pf default-deny + pf counters (or vsock-proxied) |
 | CPU+memory meter | cgroup v2 `cpu.stat` / `memory.current`: `MeterSource::CgroupV2` | host-thread rusage/Mach + boot-time memory cap: add `MeterSource::HostRusage`; declare `MeterFidelity` as coarser so the daemon widens the halt margin |

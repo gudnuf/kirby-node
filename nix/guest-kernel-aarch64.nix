@@ -132,8 +132,7 @@ in
 #      current macOS; GIC v3 is forced =y. If a future/older VZ exposed GIC v2,
 #      ARM_GIC (v2) would also be needed; not added now to keep the config minimal
 #      and because v3 is the current VZ reality.
-#   4. BOOT IMAGE = the uncompressed vmlinux ELF (same as x86), which is what VZ's
-#      VZLinuxBootLoader consumes (it takes an uncompressed kernel, not a raw arm64
-#      `Image`). The image build (nix/genome-image-aarch64.nix) takes
-#      ${kernel.dev}/vmlinux, which nixpkgs installs for every arch when
-#      CONFIG_MODULES=y (build.nix `cp vmlinux $dev/`).
+#   4. BOOT IMAGE = VZLinuxBootLoader consumes a raw arm64 `Image`. The image
+#      output still carries ${kernel.dev}/vmlinux, as x86 does; the macOS backend
+#      derives the raw Image from the ELF PT_LOAD segments at boot until the image
+#      derivation exports Image directly.
