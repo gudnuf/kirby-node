@@ -106,6 +106,9 @@ impl SandboxBackend for VzBackend {
         if let Ok(ms) = std::env::var("KIRBY_VZ_PROBE_STOP_VM_AFTER_READY_MS") {
             command.arg("--probe-stop-vm-after-ready-ms").arg(ms);
         }
+        if let Ok(ms) = std::env::var("KIRBY_VZ_PROBE_PAUSE_VM_AFTER_READY_MS") {
+            command.arg("--probe-pause-vm-after-ready-ms").arg(ms);
+        }
 
         tracing::info!(
             helper = %helper.display(),

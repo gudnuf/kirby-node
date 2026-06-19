@@ -3,6 +3,9 @@ import Dispatch
 import Foundation
 import Virtualization
 
+// The bridge deadline is an idle/liveness guard. The genome's HTTP/2 keepalive
+// traffic keeps live connections active; real act-latency limits belong in the
+// genome/client request timeout, not here.
 private let bridgeReadDeadlineSeconds = 60
 private let udsConnectDeadlineSeconds = 10.0
 private var retainedTermSignal: DispatchSourceSignal?
@@ -30,6 +33,7 @@ private struct HelperArgs {
     let workload: String?
     // Hidden diagnostic hook for the VZ dead-fd probe. Normal boots leave this nil.
     let probeStopVmAfterReadyMs: Int?
+    let probePauseVmAfterReadyMs: Int?
 
     static func parse(_ argv: [String]) -> HelperArgs {
         var values: [String: String] = [:]
@@ -65,7 +69,8 @@ private struct HelperArgs {
             cpuCount: cpuCount,
             memoryMib: memoryMib,
             workload: values["workload"],
-            probeStopVmAfterReadyMs: values["probe-stop-vm-after-ready-ms"].flatMap(Int.init)
+            probeStopVmAfterReadyMs: values["probe-stop-vm-after-ready-ms"].flatMap(Int.init),
+            probePauseVmAfterReadyMs: values["probe-pause-vm-after-ready-ms"].flatMap(Int.init)
         )
     }
 }
@@ -124,12 +129,15 @@ private func connectUnix(path: String) -> Int32 {
     return -1
 }
 
-private func setReadDeadline(fd: Int32, seconds: Int) {
+private func requireReadDeadline(fd: Int32, label: String, seconds: Int) {
     var timeout = timeval(tv_sec: seconds, tv_usec: 0)
-    _ = withUnsafePointer(to: &timeout) { ptr in
+    let rc = withUnsafePointer(to: &timeout) { ptr in
         ptr.withMemoryRebound(to: UInt8.self, capacity: MemoryLayout<timeval>.size) { raw in
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, raw, socklen_t(MemoryLayout<timeval>.size))
         }
+    }
+    if rc != 0 {
+        fatal("set_read_deadline_failed fd=\(label) errno=\(errno)")
     }
 }
 
@@ -195,6 +203,8 @@ private final class ActiveBridge {
     private let connection: VZVirtioSocketConnection
     private let udsFd: Int32
     private let vzFd: Int32
+    private let closeLock = NSLock()
+    private var closed = false
 
     init(id: UUID, connection: VZVirtioSocketConnection, udsFd: Int32) {
         self.id = id
@@ -204,8 +214,8 @@ private final class ActiveBridge {
     }
 
     func start(onClose: @escaping () -> Void) {
-        setReadDeadline(fd: vzFd, seconds: bridgeReadDeadlineSeconds)
-        setReadDeadline(fd: udsFd, seconds: bridgeReadDeadlineSeconds)
+        requireReadDeadline(fd: vzFd, label: "vz", seconds: bridgeReadDeadlineSeconds)
+        requireReadDeadline(fd: udsFd, label: "uds", seconds: bridgeReadDeadlineSeconds)
 
         let group = DispatchGroup()
         group.enter()
@@ -226,6 +236,13 @@ private final class ActiveBridge {
     }
 
     func close() {
+        closeLock.lock()
+        if closed {
+            closeLock.unlock()
+            return
+        }
+        closed = true
+        closeLock.unlock()
         connection.close()
         Darwin.close(udsFd)
     }
@@ -287,6 +304,7 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
     private let bridge: SocketBridge
     private let gatewayPort: UInt32
     private let probeStopVmAfterReadyMs: Int?
+    private let probePauseVmAfterReadyMs: Int?
     private var listener: VZVirtioSocketListener?
     private var stopping = false
 
@@ -294,12 +312,14 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
         vm: VZVirtualMachine,
         bridge: SocketBridge,
         gatewayPort: UInt32,
-        probeStopVmAfterReadyMs: Int?
+        probeStopVmAfterReadyMs: Int?,
+        probePauseVmAfterReadyMs: Int?
     ) {
         self.vm = vm
         self.bridge = bridge
         self.gatewayPort = gatewayPort
         self.probeStopVmAfterReadyMs = probeStopVmAfterReadyMs
+        self.probePauseVmAfterReadyMs = probePauseVmAfterReadyMs
         super.init()
     }
 
@@ -326,6 +346,12 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
                     self.probeStopVmAndKeepHelperAlive()
                 }
             }
+            if let ms = self.probePauseVmAfterReadyMs {
+                stderrLine("KIRBY_VZ_PROBE_PAUSE_VM_SCHEDULED after_ready_ms=\(ms)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) {
+                    self.probePauseVmAndKeepHelperAlive()
+                }
+            }
         }
     }
 
@@ -340,6 +366,21 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
                 stderrLine("KIRBY_VZ_PROBE_STOP_VM_ERROR \(error)")
             } else {
                 stderrLine("KIRBY_VZ_PROBE_STOP_VM_DONE state=\(self.vm.state.rawValue)")
+            }
+        }
+    }
+
+    func probePauseVmAndKeepHelperAlive() {
+        stderrLine("KIRBY_VZ_PROBE_PAUSE_VM_BEGIN state=\(vm.state.rawValue)")
+        guard vm.canPause else {
+            stderrLine("KIRBY_VZ_PROBE_PAUSE_VM_SKIPPED can_pause=false state=\(vm.state.rawValue)")
+            return
+        }
+        vm.pause { result in
+            if case .failure(let error) = result {
+                stderrLine("KIRBY_VZ_PROBE_PAUSE_VM_ERROR \(error)")
+            } else {
+                stderrLine("KIRBY_VZ_PROBE_PAUSE_VM_DONE state=\(self.vm.state.rawValue)")
             }
         }
     }
@@ -364,7 +405,7 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         stderrLine("KIRBY_VZ_GUEST_STOPPED")
-        if probeStopVmAfterReadyMs != nil {
+        if probeStopVmAfterReadyMs != nil || probePauseVmAfterReadyMs != nil {
             return
         }
         stopAndExit(code: 0)
@@ -372,7 +413,7 @@ private final class VmController: NSObject, VZVirtualMachineDelegate {
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         stderrLine("KIRBY_VZ_STOPPED_WITH_ERROR \(error)")
-        if probeStopVmAfterReadyMs != nil {
+        if probeStopVmAfterReadyMs != nil || probePauseVmAfterReadyMs != nil {
             return
         }
         stopAndExit(code: 1)
@@ -461,7 +502,8 @@ private let controller = VmController(
     vm: vm,
     bridge: bridge,
     gatewayPort: args.gatewayPort,
-    probeStopVmAfterReadyMs: args.probeStopVmAfterReadyMs
+    probeStopVmAfterReadyMs: args.probeStopVmAfterReadyMs,
+    probePauseVmAfterReadyMs: args.probePauseVmAfterReadyMs
 )
 vm.delegate = controller
 installSignalHandlers(controller: controller, parentPid: parentPid)
