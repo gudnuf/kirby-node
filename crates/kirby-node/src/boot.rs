@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use kirby_proto::Event;
 
-use crate::checkpoint::CheckpointArtifact;
+use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 #[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
@@ -38,6 +38,7 @@ use crate::vz::VzBackend;
 /// Where the genome image artifacts live (built by `nix build .#genome-image`).
 /// Resolved from `--image-dir` or the `KIRBY_GENOME_IMAGE` env var, both of
 /// which point at the image output (containing vmlinux and rootfs.squashfs).
+#[derive(Clone)]
 pub struct ImagePaths {
     pub vmlinux: PathBuf,
     pub rootfs: PathBuf,
@@ -60,6 +61,7 @@ impl ImagePaths {
 }
 
 /// Inputs for one boot demonstration.
+#[derive(Clone)]
 pub struct BootConfig {
     pub image: ImagePaths,
     pub node_id: String,
@@ -110,6 +112,10 @@ pub struct BootOutcome {
     pub hello: Option<Event>,
     /// The session context the gateway handed the genome (the budget snapshot).
     pub budget_sats: u64,
+    /// Shared handle to checkpoints this boot's gateway accepted from the genome.
+    /// Most boot/meter/egress paths ignore it; app-checkpoint resume uses it to
+    /// persist the exact logical-state blob the daemon accepted.
+    pub checkpoints: LatestCheckpoint,
 }
 
 /// Boot the genome through the sandbox backend, serve the agnostic gateway over
@@ -230,6 +236,7 @@ pub async fn boot_and_observe_with_rail(
         reached_running,
         hello,
         budget_sats: config.budget_sats,
+        checkpoints: service.checkpoint_handle(),
     };
     Ok((instance, outcome, meter_treasury, events))
 }
