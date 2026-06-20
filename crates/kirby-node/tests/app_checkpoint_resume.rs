@@ -26,13 +26,33 @@ async fn portable_app_checkpoint_handoff_boots_fresh_and_restores_logical_state(
         .expect("app-checkpoint handoff run");
     eprintln!("{}", app_checkpoint_run::evidence_line(&outcome));
     assert!(
-        outcome.passed(),
+        outcome.handoff_passed(),
         "app-checkpoint handoff did not satisfy the portable restore proof"
+    );
+    let pre = outcome
+        .fingerprint_pre
+        .as_deref()
+        .expect("node 1 must report a pre-checkpoint entropy fingerprint");
+    let post = outcome
+        .fingerprint_post
+        .as_deref()
+        .expect("node 2 must report a post-restore entropy fingerprint");
+    assert_ne!(
+        pre, post,
+        "correct app-checkpoint restore must re-fetch entropy; equal fingerprints would reproduce stale nonce reuse"
+    );
+    assert!(
+        outcome.entropy_call_before_restore_act,
+        "node 2 must call GetEntropyNonce before reporting the restore-side act"
+    );
+    assert!(
+        outcome.passed(),
+        "app-checkpoint handoff did not satisfy the entropy redrive invariant"
     );
 }
 
 #[tokio::test]
-async fn negative_control_smuggled_checkpoint_secret_fails_closed() {
+async fn negative_control_reused_checkpoint_nonce_reproduces_stale_fingerprint() {
     let Some(base) = base_config("app_checkpoint_negative_control", 51, 5051) else {
         return;
     };
@@ -40,12 +60,33 @@ async fn negative_control_smuggled_checkpoint_secret_fails_closed() {
     let mut config = AppCheckpointRunConfig::new_negative_control(base);
     config.checkpoint_timeout = Duration::from_secs(40);
 
-    let err = app_checkpoint_run::run(config)
+    let outcome = app_checkpoint_run::run(config)
         .await
-        .expect_err("smuggled checkpoint secret must fail closed");
+        .expect("negative-control app-checkpoint handoff run");
+    eprintln!("{}", app_checkpoint_run::evidence_line(&outcome));
     assert!(
-        err.to_string().contains("checkpoint membrane violation"),
-        "negative-control workload must be rejected by the checkpoint membrane, got: {err}"
+        outcome.handoff_passed(),
+        "the broken genome must still complete the handoff so the invariant is tested: {outcome:?}"
+    );
+    let pre = outcome
+        .fingerprint_pre
+        .as_deref()
+        .expect("broken genome must report a pre-checkpoint fingerprint");
+    let post = outcome
+        .fingerprint_post
+        .as_deref()
+        .expect("broken genome must report a post-restore fingerprint");
+    assert_eq!(
+        pre, post,
+        "negative control must reuse the smuggled pre-checkpoint entropy material after restore"
+    );
+    assert!(
+        outcome.fingerprints_equal(),
+        "the broken genome's stale fingerprint must be observable"
+    );
+    assert!(
+        !outcome.entropy_redrive_passed(),
+        "the app-checkpoint entropy invariant must fail for a reused checkpoint nonce"
     );
 }
 

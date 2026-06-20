@@ -31,9 +31,11 @@ pub struct AppCheckpointRunConfig {
     /// Durable local checkpoint store used for the same-host proof.
     pub store_dir: PathBuf,
     /// Node 1 workload. The normal proof uses `app-checkpoint`; the negative
-    /// control uses a deliberately-broken genome workload that smuggles stale
-    /// ephemeral state into the checkpoint and must be rejected before storage.
+    /// control smuggles raw entropy material into the checkpoint.
     pub node1_workload: String,
+    /// Node 2 workload. The normal proof re-derives from fresh entropy after the
+    /// app checkpoint restore; the negative control reuses the smuggled material.
+    pub node2_workload: String,
     /// How long to wait for node 1 to submit a checkpoint.
     pub checkpoint_timeout: Duration,
     /// How long to wait for node 2 to report that it saw the restore checkpoint.
@@ -57,6 +59,7 @@ impl AppCheckpointRunConfig {
             node2_gateway_port,
             store_dir,
             node1_workload: "app-checkpoint".to_string(),
+            node2_workload: "app-checkpoint".to_string(),
             checkpoint_timeout: Duration::from_secs(40),
             restore_timeout: Duration::from_secs(40),
         }
@@ -66,6 +69,7 @@ impl AppCheckpointRunConfig {
         boot.workload = Some("app-checkpoint-smuggle-secret".to_string());
         let mut config = Self::new(boot);
         config.node1_workload = "app-checkpoint-smuggle-secret".to_string();
+        config.node2_workload = "app-checkpoint-reuse-smuggled-nonce".to_string();
         config
     }
 }
@@ -83,10 +87,13 @@ pub struct AppCheckpointRunOutcome {
     pub restore_detail: Option<String>,
     pub second_checkpoint_submitted: bool,
     pub second_checkpoint_ref: Option<CheckpointRef>,
+    pub fingerprint_pre: Option<String>,
+    pub fingerprint_post: Option<String>,
+    pub entropy_call_before_restore_act: bool,
 }
 
 impl AppCheckpointRunOutcome {
-    pub fn passed(&self) -> bool {
+    pub fn handoff_passed(&self) -> bool {
         self.node1_reached_running
             && self.first_checkpoint_submitted
             && self.first_checkpoint_ref.is_some()
@@ -98,11 +105,29 @@ impl AppCheckpointRunOutcome {
             && self.second_checkpoint_submitted
             && self.second_checkpoint_ref.is_some()
     }
+
+    pub fn fingerprints_equal(&self) -> bool {
+        self.fingerprint_pre.is_some()
+            && self.fingerprint_post.is_some()
+            && self.fingerprint_pre == self.fingerprint_post
+    }
+
+    pub fn entropy_redrive_passed(&self) -> bool {
+        self.handoff_passed()
+            && self.fingerprint_pre.is_some()
+            && self.fingerprint_post.is_some()
+            && !self.fingerprints_equal()
+            && self.entropy_call_before_restore_act
+    }
+
+    pub fn passed(&self) -> bool {
+        self.entropy_redrive_passed()
+    }
 }
 
 pub fn evidence_line(outcome: &AppCheckpointRunOutcome) -> String {
     format!(
-        "APP-CHECKPOINT {}: node1_running={} first_checkpoint_ref={} first_checkpoint_bytes={} store_round_trip={} node1_halted={} node2_running={} restore_seen={} restore_detail={:?} second_checkpoint_ref={}",
+        "APP-CHECKPOINT {}: node1_running={} first_checkpoint_ref={} first_checkpoint_bytes={} store_round_trip={} node1_halted={} node2_running={} restore_seen={} restore_detail={:?} second_checkpoint_ref={} fingerprint_pre={} fingerprint_post={} fingerprints_equal={} entropy_call_before_restore_act={}",
         if outcome.passed() { "PASS" } else { "FAIL" },
         outcome.node1_reached_running,
         outcome
@@ -120,7 +145,11 @@ pub fn evidence_line(outcome: &AppCheckpointRunOutcome) -> String {
             .second_checkpoint_ref
             .as_ref()
             .map(|r| format!("{}:{}", r.sha256, r.len))
-            .unwrap_or_else(|| "<none>".to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        outcome.fingerprint_pre.as_deref().unwrap_or("<none>"),
+        outcome.fingerprint_post.as_deref().unwrap_or("<none>"),
+        outcome.fingerprints_equal(),
+        outcome.entropy_call_before_restore_act
     )
 }
 
@@ -141,12 +170,8 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
         anyhow::bail!("app-checkpoint node 1 did not reach Running");
     }
 
-    let first_submit = wait_for_event(
-        &mut node1_events,
-        "checkpoint_submitted",
-        config.checkpoint_timeout,
-    )
-    .await;
+    let first_observation =
+        wait_for_checkpoint_submit(&mut node1_events, config.checkpoint_timeout, Some("pre")).await;
     let checkpoint = latest_checkpoint(&node1_outcome.checkpoints)?;
     if let Err(e) = validate_checkpoint_membrane(&checkpoint) {
         node1.halt().await;
@@ -175,7 +200,7 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
     node2_boot.node_id = config.node2_id.clone();
     node2_boot.guest_cid = config.node2_guest_cid;
     node2_boot.gateway_port = config.node2_gateway_port;
-    node2_boot.workload = Some("app-checkpoint".to_string());
+    node2_boot.workload = Some(config.node2_workload.clone());
     node2_boot.lockdown_egress = false;
     node2_boot.snapshot_capable = false;
     node2_boot.restore_checkpoint = Some(loaded.clone());
@@ -187,23 +212,16 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
         anyhow::bail!("app-checkpoint node 2 did not reach Running");
     }
 
-    let restore_event = wait_for_event(
-        &mut node2_events,
-        "checkpoint_restore_seen",
-        config.restore_timeout,
-    )
-    .await;
-    let restore_seen = restore_event
+    let restore_observation =
+        wait_for_restore_seen(&mut node2_events, config.restore_timeout).await;
+    let restore_seen = restore_observation
+        .restore
         .as_ref()
         .map(|event| restore_detail_matches(event, &loaded))
         .unwrap_or(false);
-    let restore_detail = restore_event.map(|event| event.detail);
-    let second_submit = wait_for_event(
-        &mut node2_events,
-        "checkpoint_submitted",
-        config.restore_timeout,
-    )
-    .await;
+    let restore_detail = restore_observation.restore.map(|event| event.detail);
+    let second_observation =
+        wait_for_checkpoint_submit(&mut node2_events, config.restore_timeout, None).await;
     let second_checkpoint = node2_outcome
         .checkpoints
         .latest()
@@ -218,7 +236,7 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
 
     Ok(AppCheckpointRunOutcome {
         node1_reached_running: node1_outcome.reached_running,
-        first_checkpoint_submitted: first_submit.is_some(),
+        first_checkpoint_submitted: first_observation.submit.is_some(),
         first_checkpoint_ref: Some(stored_ref),
         first_checkpoint_bytes: checkpoint.payload.len() as u64,
         store_round_trip,
@@ -226,8 +244,11 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
         node2_reached_running: node2_outcome.reached_running,
         restore_seen,
         restore_detail,
-        second_checkpoint_submitted: second_submit.is_some(),
+        second_checkpoint_submitted: second_observation.submit.is_some(),
         second_checkpoint_ref: second_checkpoint,
+        fingerprint_pre: first_observation.fingerprint,
+        fingerprint_post: restore_observation.fingerprint,
+        entropy_call_before_restore_act: restore_observation.entropy_call_before_restore,
     })
 }
 
@@ -272,20 +293,107 @@ fn validate_checkpoint_membrane(artifact: &CheckpointArtifact) -> anyhow::Result
     Ok(())
 }
 
-async fn wait_for_event(events: &mut EventStream, kind: &str, timeout: Duration) -> Option<Event> {
+#[derive(Default)]
+struct CheckpointSubmitObservation {
+    submit: Option<Event>,
+    fingerprint: Option<String>,
+}
+
+struct RestoreObservation {
+    restore: Option<Event>,
+    fingerprint: Option<String>,
+    entropy_call_before_restore: bool,
+}
+
+async fn wait_for_checkpoint_submit(
+    events: &mut EventStream,
+    timeout: Duration,
+    fingerprint_phase: Option<&str>,
+) -> CheckpointSubmitObservation {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut observation = CheckpointSubmitObservation::default();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return None;
+            return observation;
         }
         match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Some(event)) if event.kind == kind => return Some(event),
+            Ok(Some(event)) if event.kind == "checkpoint_submitted" => {
+                observation.submit = Some(event);
+                return observation;
+            }
+            Ok(Some(event)) if event.kind == "app_checkpoint_fingerprint" => {
+                if fingerprint_phase
+                    .map(|phase| detail_field(&event.detail, "phase") == Some(phase))
+                    .unwrap_or(true)
+                {
+                    observation.fingerprint = detail_field(&event.detail, "fingerprint")
+                        .map(str::to_string)
+                        .filter(|fingerprint| fingerprint != "<none>");
+                }
+            }
             Ok(Some(_)) => continue,
-            Ok(None) => return None,
-            Err(_) => return None,
+            Ok(None) => return observation,
+            Err(_) => return observation,
         }
     }
+}
+
+async fn wait_for_restore_seen(events: &mut EventStream, timeout: Duration) -> RestoreObservation {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut fingerprint = None;
+    let mut entropy_call_before_restore = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return RestoreObservation {
+                restore: None,
+                fingerprint,
+                entropy_call_before_restore,
+            };
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Some(event)) if event.kind == "entropy_nonce_call" => {
+                entropy_call_before_restore = true;
+            }
+            Ok(Some(event)) if event.kind == "app_checkpoint_fingerprint" => {
+                if detail_field(&event.detail, "phase") == Some("post") {
+                    fingerprint = detail_field(&event.detail, "fingerprint")
+                        .map(str::to_string)
+                        .filter(|fingerprint| fingerprint != "<none>");
+                }
+            }
+            Ok(Some(event)) if event.kind == "checkpoint_restore_seen" => {
+                return RestoreObservation {
+                    restore: Some(event),
+                    fingerprint,
+                    entropy_call_before_restore,
+                };
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                return RestoreObservation {
+                    restore: None,
+                    fingerprint,
+                    entropy_call_before_restore,
+                };
+            }
+            Err(_) => {
+                return RestoreObservation {
+                    restore: None,
+                    fingerprint,
+                    entropy_call_before_restore,
+                };
+            }
+        }
+    }
+}
+
+fn detail_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    detail
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix(&prefix))
 }
 
 #[cfg(test)]
@@ -294,7 +402,7 @@ mod tests {
 
     use crate::checkpoint::CheckpointArtifact;
 
-    use super::{restore_detail_matches, validate_checkpoint_membrane};
+    use super::{detail_field, restore_detail_matches, validate_checkpoint_membrane};
 
     #[test]
     fn restore_detail_match_requires_hash_len_and_blob_len() {
@@ -338,5 +446,15 @@ mod tests {
             err.to_string().contains("checkpoint membrane violation"),
             "negative-control checkpoint must fail closed, got: {err}"
         );
+    }
+
+    #[test]
+    fn detail_field_extracts_app_checkpoint_fingerprint_fields() {
+        let detail = "phase=post source=fresh fingerprint=deadbeef fp_gen=0 unrelated=value";
+
+        assert_eq!(detail_field(detail, "phase"), Some("post"));
+        assert_eq!(detail_field(detail, "fingerprint"), Some("deadbeef"));
+        assert_eq!(detail_field(detail, "fp_gen"), Some("0"));
+        assert_eq!(detail_field(detail, "missing"), None);
     }
 }

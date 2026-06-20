@@ -208,8 +208,17 @@ async fn run() {
             idle_forever().await;
         }
         Some("app-checkpoint-smuggle-secret") => {
-            boot_log("workload=app-checkpoint-smuggle-secret: NEGATIVE CONTROL, smuggles stale ephemeral state in the logical checkpoint");
-            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::SmuggleSecret).await;
+            boot_log(
+                "workload=app-checkpoint-smuggle-secret: NEGATIVE CONTROL, smuggles raw entropy material in the logical checkpoint",
+            );
+            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::SmuggleNonce).await;
+            idle_forever().await;
+        }
+        Some("app-checkpoint-reuse-smuggled-nonce") => {
+            boot_log(
+                "workload=app-checkpoint-reuse-smuggled-nonce: NEGATIVE CONTROL, reuses checkpoint-smuggled entropy material after restore",
+            );
+            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::ReuseSmuggledNonce).await;
             idle_forever().await;
         }
         Some("snapshot") => {
@@ -282,7 +291,14 @@ async fn run() {
 /// after boot, never from this blob.
 enum AppCheckpointMode {
     Clean,
-    SmuggleSecret,
+    SmuggleNonce,
+    ReuseSmuggledNonce,
+}
+
+struct EntropyMaterial {
+    fingerprint: String,
+    generation: u64,
+    nonce: Vec<u8>,
 }
 
 async fn submit_app_checkpoint(
@@ -295,6 +311,58 @@ async fn submit_app_checkpoint(
         .as_ref()
         .map(|r| format!("sha256={} len={}", r.sha256, r.len))
         .unwrap_or_else(|| "none".to_string());
+
+    let restored = ctx.restore_checkpoint.is_some();
+    let phase = if restored { "post" } else { "pre" };
+    let (fingerprint, fp_gen, source, smuggled) = match mode {
+        AppCheckpointMode::ReuseSmuggledNonce if restored => {
+            match smuggled_entropy_material(&ctx.restore_checkpoint_blob) {
+                Some((nonce, generation)) => (
+                    fingerprint::derive(&nonce, generation),
+                    generation,
+                    "reused",
+                    None,
+                ),
+                None => {
+                    report_brokered(
+                        client,
+                        "app_checkpoint_fingerprint",
+                        "phase=post source=reused_missing fingerprint=<none> fp_gen=<none>",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        _ => match fresh_entropy_material(client).await {
+            Some(material) => {
+                let smuggled = if matches!(mode, AppCheckpointMode::SmuggleNonce) {
+                    Some((material.generation, material.nonce.clone()))
+                } else {
+                    None
+                };
+                (material.fingerprint, material.generation, "fresh", smuggled)
+            }
+            None => {
+                report_brokered(
+                    client,
+                    "app_checkpoint_fingerprint",
+                    &format!(
+                        "phase={phase} source=fresh_failed fingerprint=<none> fp_gen=<none>"
+                    ),
+                )
+                .await;
+                return;
+            }
+        },
+    };
+    report_brokered(
+        client,
+        "app_checkpoint_fingerprint",
+        &format!("phase={phase} source={source} fingerprint={fingerprint} fp_gen={fp_gen}"),
+    )
+    .await;
+
     if ctx.restore_checkpoint.is_some() {
         let detail = format!(
             "restore_seen {restore} blob_len={}",
@@ -308,8 +376,9 @@ async fn submit_app_checkpoint(
         ctx.task_descriptor, ctx.budget_sats
     )
     .into_bytes();
-    if matches!(mode, AppCheckpointMode::SmuggleSecret) {
-        payload.extend_from_slice(b" stale_nonce=negative-control-reused-across-restore");
+    if let Some((generation, nonce)) = smuggled {
+        payload.extend_from_slice(&generation.to_be_bytes());
+        payload.extend_from_slice(&nonce);
     }
     let payload_len = payload.len();
 
@@ -335,6 +404,37 @@ async fn submit_app_checkpoint(
             boot_log(&detail);
         }
     }
+}
+
+async fn fresh_entropy_material(
+    client: &mut NodeGatewayClient<tonic::transport::Channel>,
+) -> Option<EntropyMaterial> {
+    let nonce = client
+        .get_entropy_nonce(EntropyRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+        })
+        .await
+        .ok()?
+        .into_inner();
+    let fingerprint = fingerprint::derive(&nonce.nonce, nonce.vm_generation);
+    Some(EntropyMaterial {
+        fingerprint,
+        generation: nonce.vm_generation,
+        nonce: nonce.nonce,
+    })
+}
+
+fn smuggled_entropy_material(payload: &[u8]) -> Option<(Vec<u8>, u64)> {
+    const GENERATION_LEN: usize = 8;
+    const NONCE_LEN: usize = 32;
+    const TRAILER_LEN: usize = GENERATION_LEN + NONCE_LEN;
+    if payload.len() < TRAILER_LEN {
+        return None;
+    }
+    let trailer = &payload[payload.len() - TRAILER_LEN..];
+    let generation = u64::from_be_bytes(trailer[..GENERATION_LEN].try_into().ok()?);
+    let nonce = trailer[GENERATION_LEN..].to_vec();
+    Some((nonce, generation))
 }
 
 /// The brokered-act workload (spec 3.2, D-6, gate G5). The genome asks the daemon
