@@ -26,11 +26,8 @@
 //! The VM is halted before returning after a successful boot. On Linux, the TAP
 //! eBPF meter is torn down before halt.
 
-use std::time::Duration;
-
-#[cfg(target_os = "linux")]
-use anyhow::Context;
 use kirby_proto::Event;
+use std::time::Duration;
 
 use crate::boot::{self, BootConfig};
 #[cfg(target_os = "linux")]
@@ -297,7 +294,7 @@ async fn run_platform_brokered(
         performed = receipt.performed,
         cost_sats = receipt.cost_sats,
         treasury_before,
-        ?treasury_after = treasury_after.as_ref().ok(),
+        treasury_after = ?treasury_after.as_ref().ok(),
         ebpf_egress_bytes,
         "G5 evidence gathered; halting the VM and tearing down the TAP"
     );
