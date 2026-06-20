@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use kirby_proto::Event;
 
+use crate::checkpoint::CheckpointArtifact;
 #[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
@@ -88,6 +89,11 @@ pub struct BootConfig {
     /// G6): the backend applies the cross-CPU template (T2CL) at create. The
     /// C-2..C-6 default is false (no template, no snapshot).
     pub snapshot_capable: bool,
+    /// Optional app-level checkpoint to hand to a freshly booted genome through
+    /// `GetSessionContext`. This is the portable Linux<->macOS resume path: the
+    /// backend performs an ordinary cold boot, while the shared gateway tells the
+    /// genome which logical state blob to rehydrate.
+    pub restore_checkpoint: Option<CheckpointArtifact>,
 }
 
 /// The gateway event receiver the genome's `ReportEvent`s arrive on (diagnostic
@@ -150,6 +156,9 @@ pub async fn boot_and_observe_with_rail(
     // counter, D-9): metered ticks and capability spends debit the same balance.
     let meter_treasury = treasury.clone();
     let mut service = GatewayService::new(treasury, rail, session);
+    if let Some(checkpoint) = config.restore_checkpoint.clone() {
+        service = service.with_restore_checkpoint(checkpoint);
+    }
 
     // Observe ReportEvents so we can await the genome's boot hello (G1).
     let mut events = service.observe_events();

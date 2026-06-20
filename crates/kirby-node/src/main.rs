@@ -880,6 +880,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         // G1 does not snapshot (no CPU template); snapshot is the `snapshot`
         // subcommand (C-7, G6).
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let (vm, outcome, _treasury, _events) = boot::boot_and_observe(config).await?;
@@ -973,6 +974,7 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         // `egress` subcommand (C-5, G4). Vsock-only here.
         lockdown_egress: false,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let config = metered_run::MeteredRunConfig {
@@ -1064,6 +1066,7 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         workload: Some("raw-egress".to_string()),
         lockdown_egress: true,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let config =
@@ -1171,6 +1174,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         workload: Some("brokered".to_string()),
         lockdown_egress: false,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let config =
@@ -1282,6 +1286,7 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
         // fresh TAP only if this is true. Vsock-only keeps the demo lean.
         lockdown_egress: false,
         snapshot_capable: true,
+        restore_checkpoint: None,
     };
 
     let mut config = snapshot_run::SnapshotRunConfig::new(boot_config);
