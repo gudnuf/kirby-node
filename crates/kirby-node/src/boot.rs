@@ -78,8 +78,9 @@ pub struct BootConfig {
     /// The genome workload the daemon requests on the kernel command line. `None`
     /// idles after the boot round-trip (C-2 / G1); `Some("burn")` runs the C-4
     /// metering workload (allocate memory + spin CPU) so the meter trips the halt
-    /// (G2); `Some("raw-egress")` runs the C-5 egress probe (attempt direct
-    /// outbound, which must fail, gate G4).
+    /// (G2); `Some("app-checkpoint")` submits portable logical state for resume;
+    /// `Some("raw-egress")` runs the C-5 egress probe (attempt direct outbound,
+    /// which must fail, gate G4).
     pub workload: Option<String>,
     /// Wire a per-VM TAP into the VM and lock it down with nftables default-deny
     /// egress (C-5, spec 3.7, gate G4). When true, the VM gets a network interface

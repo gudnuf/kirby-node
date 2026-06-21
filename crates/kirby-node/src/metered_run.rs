@@ -16,6 +16,7 @@
 use std::time::Duration;
 
 use crate::boot::{self, BootConfig};
+use crate::checkpoint::CheckpointArtifact;
 #[cfg(target_os = "macos")]
 use crate::meter::HostProcessMeterConfig;
 #[cfg(target_os = "linux")]
@@ -60,6 +61,9 @@ pub struct MeteredRunOutcome {
     /// The daemon killed the VM (true here always): the budget-death halt is
     /// daemon-initiated, the genome did not exit on its own (G2).
     pub daemon_initiated_kill: bool,
+    /// Latest app-checkpoint submitted by the genome during this metered run, if
+    /// the selected workload is checkpoint-aware.
+    pub latest_checkpoint: Option<CheckpointArtifact>,
 }
 
 /// Inputs for a metered run. Reuses the boot config and adds the meter tick (the
@@ -101,6 +105,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
         vm.halt().await;
         anyhow::bail!("metered run: VM did not reach Running");
     }
+    let checkpoints = outcome.checkpoints.clone();
 
     // Attach the backend-reported host meter source. The burn math and treasury
     // debit are shared; only the sample source differs by platform.
@@ -203,6 +208,10 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
         }
     };
 
+    let latest_checkpoint = checkpoints
+        .latest()
+        .map_err(|e| anyhow::anyhow!("metered run: read latest checkpoint: {e}"))?;
+
     Ok(MeteredRunOutcome {
         terminated,
         burned_sats: meter.burned_sats(),
@@ -215,6 +224,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
         // called vm.halt(); the genome never exits on its own (it idles/burns
         // until the daemon kills it). This is the G2 "daemon killed it" property.
         daemon_initiated_kill: true,
+        latest_checkpoint,
     })
 }
 
