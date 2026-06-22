@@ -126,6 +126,7 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
         mem_size_mib: 128,
         hello_timeout: Duration::from_secs(40),
         workload: Some("brokered".to_string()),
+        brain: None,
         // BrokeredRunConfig chooses the backend-specific profile.
         lockdown_egress: false,
         snapshot_capable: false,
@@ -346,6 +347,8 @@ fn assert_no_credential_on_the_wire() {
         cost_sats: 0,
         treasury_remaining: 0,
         proof: vec![],
+        // The brain-act reply text (empty for an ecash settle); still not a credential.
+        completion: vec![],
     };
     let CapabilityReceipt {
         schema_version: _,
@@ -353,6 +356,7 @@ fn assert_no_credential_on_the_wire() {
         cost_sats: _,
         treasury_remaining: _,
         proof: _,
+        completion: _,
     } = &receipt;
 }
 
