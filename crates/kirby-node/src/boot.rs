@@ -305,7 +305,7 @@ async fn build_nostr_actuator(
 
 /// The per-node treasury store path (the daemon-owned counter, D-9). A per-node temp
 /// store keeps two node processes distinct on one host.
-fn treasury_path_for(node_id: &str) -> PathBuf {
+pub(crate) fn treasury_path_for(node_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kirby-treasury-{node_id}"))
 }
 
@@ -464,7 +464,9 @@ pub async fn boot_and_observe_with_rail(
     // started term. `None` (the single-agent default) leaves the gateway unfenced
     // exactly as before, so a bare `kirby run` is byte-identical.
     if let Some(fence) = config.lease_fence.clone() {
-        service = service.with_lease_fence_for(fence.handle, fence.agent_id, fence.vm_term);
+        // `fence.handle` is already an `Arc<dyn LeaseAuthority>` (the trait seam), so attach
+        // it through `with_lease_authority` rather than re-boxing a concrete handle.
+        service = service.with_lease_authority(fence.handle, fence.agent_id, fence.vm_term);
     }
 
     // Observe ReportEvents so we can await the genome's boot hello (G1).
