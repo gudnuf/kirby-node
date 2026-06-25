@@ -762,7 +762,19 @@ enum SigningMode {
     SingleKey(Keys),
     /// The FROST path: a quorum signer produces the aggregate-signed event under Q. The client has
     /// NO signer set (we never call `send_event_builder`; we send a pre-built owned `Event`).
-    Frost(Arc<crate::quorum_signer::QuorumSigner>),
+    ///
+    /// The group taproot key Q is validated ONCE into a `nostr_sdk::PublicKey` at construction
+    /// (`connect_frost`) and STORED here, so `public_key()` is a fail-closed accessor that returns
+    /// the SAME identity the quorum signs under. There is NO silent wrong-key fallback: if Q ever
+    /// failed to parse as an x-only key, construction would have errored loudly (it cannot, since
+    /// `group_xonly_q` always yields a valid x-only key -- but a future drift fails loud, never
+    /// exposing a mismatched npub).
+    Frost {
+        quorum: Arc<crate::quorum_signer::QuorumSigner>,
+        /// The validated group public key Q (= `quorum.q_bytes()` as a nostr PublicKey). Stored so
+        /// the identity reported by `public_key()` can never diverge from what the quorum signs.
+        q_public_key: nostr_sdk::PublicKey,
+    },
 }
 
 /// The real outward actuator (`nostr.publish`): holds the signing mode (single-key OR a FROST
@@ -827,14 +839,28 @@ impl NostrActuator {
                 .with_context(|| format!("add actuator relay {url}"))?;
         }
         client.connect().await;
-        let q_npub = kirby_custody::cosign_net::npub_encode(&quorum.q_bytes()).unwrap_or_default();
+        // FAIL CLOSED on identity: validate Q -> nostr PublicKey ONCE here, where we can error
+        // loudly, and store it. `public_key()` then returns this exact value -- there is NO silent
+        // wrong-key fallback that could split-brain the reported npub from what the quorum signs.
+        let q_public_key = nostr_sdk::PublicKey::from_slice(&quorum.q_bytes()).with_context(|| {
+            format!(
+                "FROST group key Q ({}) is not a valid x-only nostr public key; refusing to start a \
+                 FROST actuator whose published identity would diverge from what it signs",
+                hex::encode(quorum.q_bytes())
+            )
+        })?;
+        let q_npub = q_public_key.to_bech32().unwrap_or_default();
         tracing::info!(
             npub = %q_npub,
             relays = relays.len(),
             cost_sats = cost_sats.max(1),
             "NostrActuator connected (FROST 2-of-3 quorum; the agent's voice is its threshold key Q)"
         );
-        Ok(NostrActuator { mode: SigningMode::Frost(quorum), client: Arc::new(client), cost_sats: cost_sats.max(1) })
+        Ok(NostrActuator {
+            mode: SigningMode::Frost { quorum, q_public_key },
+            client: Arc::new(client),
+            cost_sats: cost_sats.max(1),
+        })
     }
 
     /// Compose, SIGN, and publish a kind:1 note carrying `content` to the relay set; return the
@@ -860,24 +886,12 @@ impl NostrActuator {
                     .context("publish kind:1 note to the relay set")?;
                 Ok(output.val.to_hex())
             }
-            SigningMode::Frost(quorum) => {
-                // The 2-of-3 ceremony (with the guardian membrane on every holder) builds the
-                // aggregate-signed event under Q. created_at is the host clock (the genome sees no
-                // bytes of this). Any refusal aborts here (no publish, no proof).
-                let created_at = Timestamp::now().as_secs();
-                let event = quorum
-                    .sign_nostr_event(kirby_proto::NOSTR_KIND_TEXT_NOTE as u32, created_at, content)
-                    .context("FROST quorum failed to co-sign the kind:1 note")?;
-                // Re-materialize as a nostr-sdk Event from its NIP-01 JSON and VERIFY locally (id +
-                // BIP-340 sig under Q) before sending -- fail closed if the aggregate is bad, so a
-                // broken quorum never reaches the relay.
-                let json = serde_json::to_string(&event)
-                    .context("serialize FROST-signed event to JSON")?;
-                let sdk_event = Event::from_json(&json)
-                    .map_err(|e| anyhow::anyhow!("parse FROST-signed event: {e}"))?;
-                sdk_event
-                    .verify()
-                    .map_err(|e| anyhow::anyhow!("FROST-signed event failed local verification: {e}"))?;
+            SigningMode::Frost { quorum, .. } => {
+                // Run the REAL FROST signing path (the 2-of-3 ceremony with the guardian membrane
+                // on every holder + the local fail-closed verify-under-Q). This is the only
+                // FROST-specific, load-bearing step; the `send_event` below is the generic relay
+                // transport. `frost_sign_event` is what the in-crate test drives directly.
+                let sdk_event = self.frost_sign_event(quorum, content)?;
                 let output = self
                     .client
                     .send_event(&sdk_event)
@@ -888,19 +902,44 @@ impl NostrActuator {
         }
     }
 
+    /// The FROST-specific half of `publish_note`'s Frost branch, factored out so an in-crate test
+    /// can drive the REAL signing path (not a copy) WITHOUT a live relay: run the 2-of-3 quorum
+    /// ceremony (guardian membrane on every holder) to build the aggregate-signed kind:1 event under
+    /// Q, re-materialize it as a nostr-sdk `Event`, and VERIFY it locally (id + BIP-340 sig under Q)
+    /// before returning. Fail closed: if the aggregate is bad the event never gets built/sent.
+    /// `created_at` is the host clock (the genome sees no bytes of this). Any refusal aborts here.
+    fn frost_sign_event(
+        &self,
+        quorum: &crate::quorum_signer::QuorumSigner,
+        content: &str,
+    ) -> anyhow::Result<Event> {
+        use anyhow::Context as _;
+        let created_at = Timestamp::now().as_secs();
+        let event = quorum
+            .sign_nostr_event(kirby_proto::NOSTR_KIND_TEXT_NOTE as u32, created_at, content)
+            .context("FROST quorum failed to co-sign the kind:1 note")?;
+        // Re-materialize as a nostr-sdk Event from its NIP-01 JSON and VERIFY locally (id +
+        // BIP-340 sig under Q) before sending -- fail closed if the aggregate is bad, so a
+        // broken quorum never reaches the relay.
+        let json = serde_json::to_string(&event).context("serialize FROST-signed event to JSON")?;
+        let sdk_event =
+            Event::from_json(&json).map_err(|e| anyhow::anyhow!("parse FROST-signed event: {e}"))?;
+        sdk_event
+            .verify()
+            .map_err(|e| anyhow::anyhow!("FROST-signed event failed local verification: {e}"))?;
+        Ok(sdk_event)
+    }
+
     /// The agent's public key (the npub the note is signed by): the local key in single-key mode,
     /// or the FROST group taproot key Q in FROST mode. Exposed for the e2e to verify the published
     /// note's author; the SIGNING material never leaves the daemon.
     pub fn public_key(&self) -> nostr_sdk::PublicKey {
         match &self.mode {
             SigningMode::SingleKey(keys) => keys.public_key(),
-            SigningMode::Frost(quorum) => {
-                // Q is a 32-byte x-only key; a nostr PublicKey is x-only. This never fails for a
-                // valid group key, but fall back to the all-zero key rather than panic in an
-                // accessor (the e2e compares the published event's pubkey to this).
-                nostr_sdk::PublicKey::from_slice(&quorum.q_bytes())
-                    .unwrap_or_else(|_| nostr_sdk::PublicKey::from_slice(&[2u8; 32]).expect("placeholder"))
-            }
+            // FAIL CLOSED: return the Q public key VALIDATED ONCE at construction. No silent
+            // wrong-key fallback -- the reported identity can never diverge from what the quorum
+            // signs (a bad Q would have failed `connect_frost`, not landed here).
+            SigningMode::Frost { q_public_key, .. } => *q_public_key,
         }
     }
 }
@@ -2197,5 +2236,96 @@ impl MemoryBackend for EngramStore {
             result,
             committed: WriteCommit::Stored,
         })
+    }
+}
+
+#[cfg(test)]
+mod frost_actuator_tests {
+    use super::*;
+    use crate::quorum_signer::local_quorum_from_keyset;
+    use bitcoin::key::TapTweak;
+    use bitcoin::secp256k1::{schnorr, Message, Secp256k1};
+    use bitcoin::KnownHrp;
+    use kirby_custody::{generate_dealer_keyset, taproot_address};
+
+    /// G-FROST-ACTUATOR-PUBLISHES-QUORUM-SIGNED-EVENT: drive the REAL FROST publish path of the
+    /// actuator (`frost_sign_event`, the FROST-specific body of `publish_note`) WITHOUT a live
+    /// relay, and assert the event it would publish is signed under the group taproot key Q and
+    /// verifies (NIP-01 id + BIP-340 schnorr under Q, NOT under the untweaked internal key P).
+    ///
+    /// This closes the gap that the gated e2e (`frost_quorum_publish.rs`) only tested a COPY of the
+    /// construction: here we build an in-process FROST-mode `NostrActuator` over a dealer keyset and
+    /// call the actuator's OWN `frost_sign_event` (the exact method `publish_note`'s Frost branch
+    /// calls before `client.send_event`). Only the generic relay transport is not exercised (it
+    /// cannot run without a relay); every FROST-specific, load-bearing step is the production code.
+    #[tokio::test]
+    async fn g_frost_actuator_publishes_quorum_signed_event() {
+        // A real 2-of-3 keyset + co-located quorum signer (in-process holders).
+        let keyset = generate_dealer_keyset(2, 3).expect("2-of-3 dealer keygen");
+        let quorum = Arc::new(local_quorum_from_keyset(&keyset).expect("build quorum signer"));
+        let q_bytes = quorum.q_bytes();
+
+        // Build the REAL FROST-mode actuator. `connect_frost` validates Q -> nostr PublicKey at
+        // construction (FIX 1) and queues the relay connection; nostr-sdk's `connect` is
+        // non-blocking, so a dummy relay URL is fine (we never send over it here).
+        let actuator = NostrActuator::connect_frost(
+            quorum.clone(),
+            std::slice::from_ref(&"ws://127.0.0.1:65535".to_string()),
+            1,
+        )
+        .await
+        .expect("connect FROST actuator");
+
+        // public_key() must be the validated Q (FIX 1 fail-closed accessor), never a fallback.
+        assert_eq!(
+            actuator.public_key().to_hex(),
+            hex::encode(q_bytes),
+            "actuator.public_key() must be the group taproot key Q (fail-closed, no fallback)"
+        );
+
+        // Drive the REAL FROST signing path the actuator uses inside publish_note.
+        let content = "Kirby speaks with a threshold voice: a 2-of-3 FROST quorum co-signed this.";
+        let event = actuator
+            .frost_sign_event(&quorum, content)
+            .expect("the actuator's real FROST publish path signs + locally verifies the event");
+
+        // The event is authored by Q, kind:1, content == input, no tags.
+        assert_eq!(event.pubkey.to_hex(), hex::encode(q_bytes), "event author is Q");
+        assert_eq!(event.kind, Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), "kind:1");
+        assert_eq!(event.content, content, "the published content is the (clean) input");
+        assert!(event.tags.is_empty(), "no tags (NIP-01 id is over tags=[])");
+
+        // The NIP-01 id is over Q + created_at + kind + content (re-derive independently).
+        let expect_id = kirby_custody::cosign_net::nip01_event_id(
+            &hex::encode(q_bytes),
+            event.created_at.as_secs(),
+            1,
+            content,
+        );
+        assert_eq!(event.id.to_hex(), hex::encode(expect_id), "the event id is the NIP-01 id under Q");
+
+        // Independently re-verify the aggregate as a raw BIP-340 schnorr sig under the TWEAKED Q,
+        // and assert it FAILS under the untweaked internal key P (the taproot tweak is real).
+        let (_addr, internal_p) =
+            taproot_address(&keyset.pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let sig = schnorr::Signature::from_slice(event.sig.as_ref()).expect("64-byte sig");
+        let msg = Message::from_digest(expect_id);
+        assert!(
+            secp.verify_schnorr(&sig, &msg, &q_xonly).is_ok(),
+            "the actuator's FROST event must verify under the tweaked group key Q"
+        );
+        assert!(
+            secp.verify_schnorr(&sig, &msg, &internal_p).is_err(),
+            "the actuator's FROST event must NOT verify under the untweaked internal key P"
+        );
+        // nostr-sdk's own verify already passed inside frost_sign_event (fail-closed) -- this is the
+        // independent custody-chain re-verification on top.
+        println!(
+            "G-FROST-ACTUATOR-PUBLISHES-QUORUM-SIGNED-EVENT PASS: the actuator's real FROST publish \
+             path produced a kind:1 event signed under Q (verifies under Q, rejected under P)"
+        );
     }
 }

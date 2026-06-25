@@ -44,7 +44,8 @@
 //! NIP-01 id, which uses `tags = []`). At-most-once stays a gateway concern (the
 //! `authorize_actuate` reserve-before-publish ordering is unchanged by this slice).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Mutex;
 
 use anyhow::Context as _;
 use frost_secp256k1_tr as frost;
@@ -79,43 +80,50 @@ fn identifier_to_u16(id: &Identifier) -> u16 {
 ///
 /// The contract a remote holder MUST also honor (it is the whole point of the
 /// membrane): `validate_and_sign` runs `guardian::validate` against ITS OWN copy of
-/// the group `pubkeys` BEFORE it produces a signature share, and returns `None`
-/// (refuse) on any validation failure -- it NEVER blind-signs whatever bytes the
-/// coordinator placed in the package.
+/// the group `pubkeys` BEFORE it produces a signature share, and refuses on any
+/// validation failure -- it NEVER blind-signs whatever bytes the coordinator placed
+/// in the package.
+///
+/// NONCE OWNERSHIP (the S5/S6-real seam): the secret `SigningNonces` NEVER crosses
+/// the trait boundary. Each holder GENERATES its own nonce in `commit` and STORES it
+/// internally keyed by `session_id`, returning ONLY the public commitment. In
+/// `validate_and_sign` the holder LOOKS UP + REMOVES its own nonce for that session,
+/// signs, and drops it immediately (used-once, dropped at scope exit). A remote
+/// holder retains its nonce on its own machine identically -- the coordinator never
+/// sees it. This is why the [`QuorumSigner`] holds NO `SigningNonces` at all.
 pub trait Holder: Send + Sync {
     /// This holder's FROST identifier as a u16 (the membrane's signer-set element).
     fn id(&self) -> u16;
 
-    /// Round 1: produce a FRESH single-use signing nonce + its public commitment.
-    /// The secret nonce stays with the holder (never crosses the seam); only the
-    /// commitment is shared with the coordinator. A remote holder returns the
-    /// serialized commitment over the wire; here it is in-process.
-    fn commit(&self) -> (SigningNonces, SigningCommitments);
+    /// Round 1: GENERATE a FRESH single-use signing nonce, STORE it internally keyed
+    /// by `session_id`, and return ONLY the public commitment. The secret nonce stays
+    /// with the holder (it never crosses the seam); a remote holder returns the
+    /// serialized commitment over the wire and keeps its nonce on its own machine.
+    fn commit(&self, session_id: u64) -> anyhow::Result<SigningCommitments>;
 
-    /// THE MEMBRANE + round 2. Given the assembled `package`, the `nonce` this
-    /// holder produced in `commit`, and the typed `req`, the holder:
-    ///   1. runs `guardian::validate(req, package, &own_pubkeys, self.id(), MIN_SIGNERS)`,
+    /// THE MEMBRANE + round 2. Given the assembled `package`, the `session_id` (whose
+    /// nonce this holder stored in `commit`), and the typed `req`, the holder:
+    ///   1. LOOKS UP + REMOVES its own stored nonce for `session_id` (used-once: it is
+    ///      dropped at the end of this call, never reusable across ceremonies),
+    ///   2. runs `guardian::validate(req, package, &own_pubkeys, self.id(), MIN_SIGNERS)`,
     ///      deriving Q from its OWN `pubkeys` (never a coordinator-asserted Q), and
-    ///   2. ONLY on `Ok(())` calls `round2::sign_with_tweak` and returns the share.
+    ///   3. ONLY on `Ok(())` calls `round2::sign_with_tweak` and returns the share.
     ///
     /// On any refusal it returns `Err(reason)` and produces NO share -> the whole
-    /// ceremony aborts (no signature emitted).
-    ///
-    /// In S3 the coordinator hands the holder its own nonce (co-located). A remote
-    /// holder would instead hold its nonce internally between `commit` and this
-    /// call; the seam shape is unchanged from the call site's view (it always gets
-    /// back a refusal-or-share).
+    /// ceremony aborts (no signature emitted). The nonce is consumed (removed) BEFORE
+    /// the membrane runs, so a refusal still drops the nonce -- it can never be reused.
     fn validate_and_sign(
         &self,
+        session_id: u64,
         req: &CoSignRequest,
         package: &SigningPackage,
-        nonce: &SigningNonces,
     ) -> Result<SignatureShare, RefuseReason>;
 }
 
-/// A co-located (in-process) holder: it owns its `KeyPackage` AND its own copy of the
+/// A co-located (in-process) holder: it owns its `KeyPackage`, its OWN copy of the
 /// group `PublicKeyPackage` (the membrane requires each holder to derive Q from its
-/// OWN pubkeys, never one the coordinator asserts). Plaintext at rest for S3.
+/// OWN pubkeys, never one the coordinator asserts), AND a per-session store of its
+/// secret nonces. Plaintext at rest for S3.
 pub struct LocalHolder {
     key_package: KeyPackage,
     /// This holder's OWN copy of the group public keys (the membrane derives Q from
@@ -123,6 +131,11 @@ pub struct LocalHolder {
     /// would hold its own persisted copy identically.
     own_pubkeys: PublicKeyPackage,
     id_u16: u16,
+    /// The holder's OWN secret nonces, keyed by `session_id`. A nonce is inserted in
+    /// `commit` and REMOVED (consumed, then dropped) in `validate_and_sign`. The
+    /// coordinator never sees this map -- it is the in-process stand-in for a remote
+    /// holder retaining its nonce on its own machine.
+    nonces: Mutex<HashMap<u64, SigningNonces>>,
 }
 
 impl LocalHolder {
@@ -134,6 +147,7 @@ impl LocalHolder {
             key_package,
             own_pubkeys,
             id_u16,
+            nonces: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -143,38 +157,54 @@ impl Holder for LocalHolder {
         self.id_u16
     }
 
-    fn commit(&self) -> (SigningNonces, SigningCommitments) {
+    fn commit(&self, session_id: u64) -> anyhow::Result<SigningCommitments> {
         // Use the custody crate's OS CSPRNG (rand 0.8 = the rand_core 0.6 the ZF
         // frost crate requires). kirby-node's own `rand` resolves to rand_core 0.9,
         // whose `OsRng` does NOT implement frost's rand_core 0.6 `RngCore`, so the
         // nonce commit must go through `kirby_custody::commit_for`.
-        kirby_custody::commit_for(&self.key_package)
+        let (nonce, commitment) = kirby_custody::commit_for(&self.key_package);
+        let mut nonces = self
+            .nonces
+            .lock()
+            .map_err(|_| anyhow::anyhow!("holder {} nonce store poisoned", self.id_u16))?;
+        // A session_id is single-use per holder; refuse to clobber a live nonce (that
+        // would silently drop an in-flight ceremony's nonce -> a stuck sign).
+        if nonces.contains_key(&session_id) {
+            anyhow::bail!(
+                "holder {} already has a live nonce for session {session_id} (nonce reuse guard)",
+                self.id_u16
+            );
+        }
+        nonces.insert(session_id, nonce);
+        Ok(commitment)
     }
 
     fn validate_and_sign(
         &self,
+        session_id: u64,
         req: &CoSignRequest,
         package: &SigningPackage,
-        nonce: &SigningNonces,
     ) -> Result<SignatureShare, RefuseReason> {
-        // THE MEMBRANE: derive Q from THIS holder's own pubkeys and require the
-        // package's message to equal the id reconstructed from the typed intent.
-        // A refusal here means NO share is produced (the ceremony aborts).
-        guardian::validate(
-            req,
-            package,
-            &self.own_pubkeys,
-            self.id_u16,
-            MIN_SIGNERS,
-        )?;
-        // Only after the membrane passed: produce the tweaked (key-path, merkle_root
-        // = None) signature share. A library error maps to MessageMismatch-adjacent
-        // refusal shape is wrong here, so surface it distinctly is impossible through
-        // RefuseReason; treat a round2 failure as a hard refusal (BadKeyset is the
-        // closest "this holder cannot sign" reason). In practice round2 only fails on
-        // a malformed package, which the membrane's equality check has already
-        // constrained to the reconstructed id.
-        frost::round2::sign_with_tweak(package, nonce, &self.key_package, None)
+        // 1. LOOK UP + REMOVE this holder's own nonce for the session. The removed
+        //    nonce lives only in this scope: used once, then dropped on return (whether
+        //    we sign OR refuse). A missing nonce (no matching `commit`) is a hard
+        //    refusal -- never reach for someone else's nonce.
+        let nonce = {
+            let mut nonces = self.nonces.lock().map_err(|_| RefuseReason::BadKeyset)?;
+            nonces.remove(&session_id).ok_or(RefuseReason::BadKeyset)?
+        };
+        // 2. THE MEMBRANE: derive Q from THIS holder's own pubkeys and require the
+        //    package's message to equal the id reconstructed from the typed intent.
+        //    A refusal here means NO share is produced (the ceremony aborts) AND the
+        //    nonce we just removed is dropped at the end of this scope (never reused).
+        guardian::validate(req, package, &self.own_pubkeys, self.id_u16, MIN_SIGNERS)?;
+        // 3. Only after the membrane passed: produce the tweaked (key-path,
+        //    merkle_root = None) signature share, consuming the nonce. Treat a round2
+        //    failure as a hard refusal (BadKeyset is the closest "this holder cannot
+        //    sign" reason). In practice round2 only fails on a malformed package,
+        //    which the membrane's equality check has already constrained to the
+        //    reconstructed id.
+        frost::round2::sign_with_tweak(package, &nonce, &self.key_package, None)
             .map_err(|_| RefuseReason::BadKeyset)
     }
 }
@@ -274,8 +304,17 @@ impl QuorumSigner {
         let q_hex = hex::encode(self.q_bytes);
         let event_id = nip01_event_id(&q_hex, created_at, kind, &sanitized);
 
-        // 3. Pick the signer set: the FIRST `MIN_SIGNERS` holders. (S5/S6 may select
-        //    a different available quorum; the ceremony shape is unchanged.)
+        // 3. Pick the signer set: the FIRST `MIN_SIGNERS` holders.
+        //
+        //    S3 SIMPLIFICATION (known): this is "2-of-the-first-2", NOT "any available
+        //    2-of-3". The ceremony always uses `holders[0..MIN_SIGNERS]` and ABORTS on
+        //    any refusal or commit failure -- it does not fall back to a different
+        //    holder. That is fine for S3, where all 3 holders are co-located in this
+        //    process and always healthy. S5/S6 (remote holders that CAN be unavailable
+        //    or slow) MUST replace this with any-available-2-of-3 selection: try a
+        //    quorum, and on a holder timeout/refusal fall back to another subset +
+        //    retry, only failing when no 2-of-3 subset is reachable. Do NOT assume the
+        //    first MIN_SIGNERS are alive once holders are off-box.
         if self.holders.len() < MIN_SIGNERS as usize {
             anyhow::bail!(
                 "QuorumSigner has {} holders, need at least {MIN_SIGNERS} to form a quorum",
@@ -293,30 +332,37 @@ impl QuorumSigner {
             anyhow::bail!("quorum holders collapsed to fewer than {MIN_SIGNERS} distinct identifiers");
         }
 
-        // 4a. Round 1: each participating holder commits a FRESH single-use nonce.
-        //     Keep each holder's nonce keyed by its u16 so round 2 hands it back the
-        //     SAME nonce (co-located shortcut; a remote holder would retain it itself).
-        let mut nonces: BTreeMap<u16, SigningNonces> = BTreeMap::new();
+        // A per-ceremony session id: each participating holder stores its own nonce
+        // under this id in `commit` and removes+drops it in `validate_and_sign`. Use
+        // the host clock; if two ceremonies share a second the holder's own
+        // contains-key guard refuses the second commit (a clobber would strand a live
+        // nonce). No `SigningNonces` is ever held by the QuorumSigner.
+        let session_id = created_at;
+
+        // 4a. Round 1: each participating holder GENERATES + STORES its OWN fresh
+        //     single-use nonce and returns ONLY its public commitment (the secret nonce
+        //     never crosses the seam -- the remote-readiness contract).
         let mut commitments: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
         for holder in &participants {
-            let (nonce, commitment) = holder.commit();
-            // Recover the frost Identifier for the package map from the commitment's
-            // owner: we only have the u16, so rebuild the Identifier from the holder's
-            // id. The trusted-dealer identifiers are 1..=n, so u16 -> Identifier is
-            // exact here.
+            let commitment = holder.commit(session_id).with_context(|| {
+                format!("holder {} round-1 commit (session {session_id})", holder.id())
+            })?;
+            // Recover the frost Identifier for the package map from the holder's u16.
+            // The trusted-dealer identifiers are 1..=n, so u16 -> Identifier is exact.
             let ident = Identifier::try_from(holder.id())
                 .map_err(|e| anyhow::anyhow!("holder id {} is not a valid FROST identifier: {e}", holder.id()))?;
-            nonces.insert(holder.id(), nonce);
             commitments.insert(ident, commitment);
         }
 
         // 4b. Assemble exactly ONE SigningPackage over the event id.
         let package = SigningPackage::new(commitments, &event_id);
 
-        // 4c. THE MEMBRANE + round 2: each participating holder validates THEN signs.
-        //     The typed request the membrane re-reconstructs and equality-checks.
+        // 4c. THE MEMBRANE + round 2: each participating holder removes its own nonce,
+        //     validates, THEN signs. The QuorumSigner passes NO nonce -- the holder
+        //     looks up + drops its own (used-once). The typed request the membrane
+        //     re-reconstructs and equality-checks.
         let req = CoSignRequest {
-            session_id: created_at, // routing/dedupe only (not security-load-bearing)
+            session_id, // routing/dedupe only (not security-load-bearing)
             intent: SignIntent::NostrEvent {
                 kind,
                 created_at,
@@ -326,11 +372,8 @@ impl QuorumSigner {
         };
         let mut shares: BTreeMap<Identifier, SignatureShare> = BTreeMap::new();
         for holder in &participants {
-            let nonce = nonces
-                .get(&holder.id())
-                .ok_or_else(|| anyhow::anyhow!("missing round-1 nonce for holder {}", holder.id()))?;
             let share = holder
-                .validate_and_sign(&req, &package, nonce)
+                .validate_and_sign(session_id, &req, &package)
                 .map_err(|reason| {
                     anyhow::anyhow!(
                         "holder {} REFUSED to co-sign ({reason:?}); ceremony aborted, NO signature emitted",
@@ -471,9 +514,11 @@ mod tests {
         let h1 = LocalHolder::new(kps_vec[0].clone(), ks.pubkeys.clone());
         let h2 = LocalHolder::new(kps_vec[1].clone(), ks.pubkeys.clone());
 
-        // Real round1 commitments over both holders.
-        let (n1, c1) = h1.commit();
-        let (n2, c2) = h2.commit();
+        // Real round1 commitments over both holders. Each holder STORES its own nonce
+        // internally keyed by this session id; round 2 looks it up + removes it.
+        let session_id = 1u64;
+        let c1 = h1.commit(session_id).expect("h1 commit");
+        let c2 = h2.commit(session_id).expect("h2 commit");
         let i1 = Identifier::try_from(h1.id()).unwrap();
         let i2 = Identifier::try_from(h2.id()).unwrap();
         let mut commitments = BTreeMap::new();
@@ -488,7 +533,7 @@ mod tests {
 
         let signer_set: BTreeSet<u16> = [h1.id(), h2.id()].into_iter().collect();
         let req = CoSignRequest {
-            session_id: 1,
+            session_id,
             intent: SignIntent::NostrEvent {
                 kind: 1,
                 created_at: CREATED_AT,
@@ -497,9 +542,11 @@ mod tests {
             signer_set,
         };
 
-        // Each holder MUST refuse (the package message != the reconstructed id).
-        let r1 = h1.validate_and_sign(&req, &tampered, &n1);
-        let r2 = h2.validate_and_sign(&req, &tampered, &n2);
+        // Each holder MUST refuse (the package message != the reconstructed id). The
+        // holder looks up + removes its OWN stored nonce for `session_id`, then the
+        // membrane rejects -> no share, and the removed nonce is dropped (never reused).
+        let r1 = h1.validate_and_sign(session_id, &req, &tampered);
+        let r2 = h2.validate_and_sign(session_id, &req, &tampered);
         assert_eq!(
             r1,
             Err(RefuseReason::MessageMismatch),
