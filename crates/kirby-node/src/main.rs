@@ -256,6 +256,32 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         node_id: u64,
     },
+    /// OPERATOR TRIGGER: build, sign, and publish a `KIND_KIRBY_SPAWN_REQUEST` (31003) to the
+    /// relay — ask any listening node to spawn an agent (the spawn control-plane #11 trigger).
+    /// Signs with the operator key (the three-keys creator key); a node that allowlists this
+    /// key (or runs open) and has the named image + capacity will claim + launch the agent.
+    SpawnRequest {
+        /// The relay to publish the request to (the fleet's shared relay).
+        #[arg(long)]
+        relay: String,
+        /// Path to the operator's Nostr secret key (bech32 `nsec...` or 64-char hex). Minted
+        /// (0600) on first use and reused after, so the operator keeps a stable pubkey. Its
+        /// pubkey (printed) is what a node's `[fleet.spawn] operators` allowlist names.
+        #[arg(long, default_value = "operator.nostr.key")]
+        operator_key: std::path::PathBuf,
+        /// The requested agent identity (the `d` tag; charset/len validated like any agent id).
+        #[arg(long)]
+        agent_id: String,
+        /// The genome image_ref the target node must have pre-staged (and allowlist).
+        #[arg(long)]
+        image_ref: String,
+        /// The declarative seed amount (sats) to fund the agent's treasury with (deposit-and-meter).
+        #[arg(long, default_value_t = 50_000)]
+        seed_sats: u64,
+        /// Optional non-secret genome config as a JSON string (task/brain/budget descriptor).
+        #[arg(long)]
+        genome_config: Option<String>,
+    },
     /// INTERNAL (not for direct use): the privileged eBPF egress-byte meter, run
     /// by the daemon through sudo (the D-7 path) because loading and attaching
     /// eBPF needs CAP_BPF the unprivileged daemon lacks. It loads the embedded TC
@@ -399,6 +425,10 @@ fn main() -> anyhow::Result<()> {
             init_tracing();
             run_fleet_supervisor_cmd(config, node_id)
         }
+        Command::SpawnRequest { relay, operator_key, agent_id, image_ref, seed_sats, genome_config } => {
+            init_tracing();
+            run_spawn_request_cmd(relay, operator_key, agent_id, image_ref, seed_sats, genome_config)
+        }
         Command::EbpfEgress { iface, tick_ms } => run_ebpf_egress(iface, tick_ms),
     }
 }
@@ -436,7 +466,6 @@ async fn run_fleet_supervisor_cmd(
     node_id: u64,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use anyhow::Context as _;
     use kirby_node::config::KirbyConfig;
@@ -496,44 +525,23 @@ async fn run_fleet_supervisor_cmd(
             r.treasury_path.display()
         );
     }
-    println!("FLEET supervisor: {} tenant(s) launched, monitoring lifecycle", records.len());
+    println!("FLEET supervisor: {} static tenant(s) launched; entering listen-and-spawn", records.len());
 
-    // The DYNAMIC spawn control-plane (#11): if enabled, subscribe to signed
-    // KIND_KIRBY_SPAWN_REQUEST events on the relay and spawn agents on demand. A node behind a
-    // LAN/NAT makes only OUTBOUND connections here (subscribe + the lease/presence publish the
-    // launch triggers), so it can host spawned agents with no inbound port. OFF by default.
-    if spawn_cfg.enabled {
-        return run_spawn_control_plane(
-            supervisor,
-            spawn_cfg,
-            &spawn_relay_url,
-            spawn_max_tenants,
-            &alloc_dir,
-        )
-        .await;
-    }
-
-    // Monitor-only (no dynamic spawn): report dead tenants on a tick (the failover hook for
-    // S5/S6; S2 only tracks). Runs until killed; exits cleanly when all tenants have died.
-    loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let dead = supervisor.dead_tenants();
-        for agent_id in &dead {
-            tracing::warn!(agent_id, "FLEET tenant EXITED (failover hook for S5/S6; S2 tracks only)");
-        }
-        if !dead.is_empty() && dead.len() == supervisor.tenant_count() {
-            // Before shutting down, REAP every exited tenant so the persisted allocator does
-            // not retain slots marked LIVE for dead CIDs/ports. Without this, a supervisor
-            // restart would reload those slots as live and never re-hand them (leaked across
-            // the restart).
-            let reaped = supervisor.reap_dead();
-            tracing::info!(
-                reaped = reaped.len(),
-                "FLEET supervisor: all tenants have exited; reaped dead allocator slots, shutting down"
-            );
-            return Ok(());
-        }
-    }
+    // The spawn control-plane (#11) ALWAYS runs: a Kirby node's purpose is to listen on the
+    // relay for signed KIND_KIRBY_SPAWN_REQUEST events and spawn agents on demand (gudnuf —
+    // listen-and-spawn is the behavior, not an opt-in). A node behind a LAN/NAT makes only
+    // OUTBOUND connections here (subscribe + the lease/presence publish the launch triggers),
+    // so it hosts spawned agents with no inbound port. Runs until killed; reaps dead tenants on
+    // a tick so a spawned-agent death frees capacity. (Static `[fleet.tenants]`, if any, were
+    // launched above and are monitored by the same reap tick.)
+    run_spawn_control_plane(
+        supervisor,
+        spawn_cfg,
+        &spawn_relay_url,
+        spawn_max_tenants,
+        &alloc_dir,
+    )
+    .await
 }
 
 /// The dynamic spawn control-plane loop (#11): subscribe to `KIND_KIRBY_SPAWN_REQUEST` on the
@@ -567,9 +575,11 @@ async fn run_spawn_control_plane(
     let images: HashSet<String> = spawn_cfg.image_allowlist.iter().cloned().collect();
     if operators.is_empty() {
         tracing::warn!(
-            "FLEET spawn: enabled with an EMPTY operator allowlist -- every spawn request will be \
-             rejected (a signed event is not authorization). Set [fleet.spawn] operators."
+            "FLEET spawn: OPEN — no operator allowlist set, so ANY signer may spawn an agent on \
+             this node (the MVP DoS vector; pops will be the real gate). Set [fleet.spawn] \
+             operators to lock it down to specific keys."
         );
+        println!("FLEET spawn: WARNING — OPEN to any requester (no operator allowlist). MVP only.");
     }
     let authorizer = Arc::new(AllowlistAuthorizer::new(
         operators,
@@ -639,6 +649,81 @@ async fn run_spawn_control_plane(
             }
         }
     }
+}
+
+/// The operator-side spawn TRIGGER (#11): build, sign, and publish a `KIND_KIRBY_SPAWN_REQUEST`
+/// (31003) to the relay. Loads-or-mints the operator key (0600), prints its pubkey (what a
+/// node's `[fleet.spawn] operators` allowlist names), and publishes the signed request. Reuses
+/// the shared `spawn::build_spawn_request_event` so the event shape matches exactly what the
+/// consumer validates. The UI publishes the same event from a browser signer; this CLI is the
+/// headless operator path (and the demo trigger).
+#[tokio::main]
+async fn run_spawn_request_cmd(
+    relay: String,
+    operator_key: std::path::PathBuf,
+    agent_id: String,
+    image_ref: String,
+    seed_sats: u64,
+    genome_config: Option<String>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use nostr_sdk::prelude::*;
+
+    use kirby_node::spawn::{build_spawn_request_event, FundingRequest, SpawnRequest};
+
+    // Load-or-mint the operator key (a stable pubkey across runs), 0600 on first write.
+    let keys = if operator_key.exists() {
+        let raw = std::fs::read_to_string(&operator_key)
+            .with_context(|| format!("read operator key {}", operator_key.display()))?;
+        Keys::parse(raw.trim()).context("parse operator key (expected nsec... or 64-char hex)")?
+    } else {
+        let keys = Keys::generate();
+        if let Some(parent) = operator_key.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        std::fs::write(&operator_key, keys.secret_key().to_secret_hex())
+            .with_context(|| format!("write new operator key {}", operator_key.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&operator_key, std::fs::Permissions::from_mode(0o600));
+        }
+        println!("minted a new operator key at {}", operator_key.display());
+        keys
+    };
+    let operator_hex = keys.public_key().to_hex();
+    println!("operator pubkey (hex): {operator_hex}");
+    println!("operator npub:         {}", keys.public_key().to_bech32().unwrap_or_default());
+
+    let genome_config = match genome_config {
+        Some(s) => serde_json::from_str(&s).context("parse --genome-config as JSON")?,
+        None => serde_json::Value::Null,
+    };
+    let req = SpawnRequest {
+        agent_id: agent_id.clone(),
+        genome_config,
+        image_ref,
+        funding: FundingRequest { seed_sats },
+        // Bind the content requester to the signer (the consumer rejects a mismatch).
+        requester_pubkey: operator_hex.clone(),
+    };
+    let event = build_spawn_request_event(&keys, &req).context("build the signed spawn request")?;
+    let event_id = event.id.to_hex();
+
+    let client = Client::builder().signer(keys.clone()).build();
+    client.add_relay(&relay).await.with_context(|| format!("add relay {relay}"))?;
+    client.connect().await;
+    client
+        .send_event(&event)
+        .await
+        .with_context(|| format!("publish spawn request to {relay}"))?;
+
+    println!("published KIND_KIRBY_SPAWN_REQUEST (31003) for agent_id={agent_id} to {relay}");
+    println!("event id: {event_id}");
+    println!("a listening node that allowlists this operator (or runs open) + has image + capacity will spawn it.");
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
