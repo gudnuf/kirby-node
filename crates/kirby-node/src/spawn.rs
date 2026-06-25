@@ -211,11 +211,12 @@ pub trait SpawnAuthorizer: Send + Sync {
     fn authorize(&self, req: &SpawnRequest, requester: &str, now_secs: u64) -> SpawnDecision;
 }
 
-/// The MVP authorizer (pops deferred): an OPERATOR ALLOWLIST + a fixed-window per-requester
-/// rate limit. The allowlist is REQUIRED — an empty allowlist denies everyone (a signed event
-/// is never self-authorizing). The rate limit bounds how many spawns one operator key can
-/// trigger per window, so even an allowlisted-but-compromised key cannot flood the fleet with
-/// VM launches.
+/// The MVP authorizer (pops deferred): an OPTIONAL operator allowlist + a fixed-window
+/// per-requester rate limit. A NON-EMPTY allowlist is enforced (only a listed key may spawn —
+/// a signature proves WHICH key, not WHETHER it may spawn). An EMPTY allowlist is OPEN: any
+/// signer may spawn (the MVP DoS vector gudnuf explicitly accepts until pops is the gate). The
+/// rate limit ALWAYS applies, so even in the open case one key cannot flood the fleet with VM
+/// launches unbounded. pops (pay-to-spawn) replaces the allowlist as the real anti-spam gate.
 pub struct AllowlistAuthorizer {
     allowed: HashSet<String>,
     max_per_window: u32,
@@ -239,8 +240,10 @@ impl AllowlistAuthorizer {
 impl SpawnAuthorizer for AllowlistAuthorizer {
     fn authorize(&self, _req: &SpawnRequest, requester: &str, now_secs: u64) -> SpawnDecision {
         // AUTH ≠ signature: the signed event only proves WHICH key; the allowlist decides
-        // WHETHER it may spawn. An empty allowlist denies everyone (safe default).
-        if !self.allowed.contains(requester) {
+        // WHETHER it may spawn. NON-EMPTY allowlist => enforce; EMPTY => OPEN (the MVP
+        // DoS-accepted mode — any signer may spawn until pops is the gate). The rate limit
+        // below applies in BOTH cases.
+        if !self.allowed.is_empty() && !self.allowed.contains(requester) {
             return SpawnDecision::Deny(format!("requester {requester} is not in the operator allowlist"));
         }
         // Fixed-window per-requester rate limit (anti-spam): even an allowlisted key cannot
@@ -663,11 +666,23 @@ mod tests {
     // ---- the AUTHORIZATION SEAM (the gate): allowlist is required, rate limit bounds floods ----
 
     #[test]
-    fn unallowlisted_requester_is_denied_even_with_a_valid_signature() {
-        // AUTH ≠ signature: an empty allowlist denies everyone; a key not in it is denied.
-        let authz = AllowlistAuthorizer::new(HashSet::new(), 100, 60);
+    fn unallowlisted_requester_is_denied_when_allowlist_is_nonempty() {
+        // AUTH ≠ signature: with a NON-EMPTY allowlist, a key not in it is denied.
+        let mut allowed = HashSet::new();
+        allowed.insert("operator".to_string());
+        let authz = AllowlistAuthorizer::new(allowed, 100, 60);
         let d = authz.authorize(&req("a", "img", 10), "deadbeef", 0);
-        assert!(matches!(d, SpawnDecision::Deny(_)), "an unallowlisted key must be denied");
+        assert!(matches!(d, SpawnDecision::Deny(_)), "a key not in a non-empty allowlist must be denied");
+    }
+
+    #[test]
+    fn empty_allowlist_is_open_mvp_dos_accepted() {
+        // EMPTY allowlist => OPEN (the MVP DoS vector gudnuf accepts until pops). Any signer is
+        // allowed, but the rate limit still applies.
+        let authz = AllowlistAuthorizer::new(HashSet::new(), 1, 60);
+        assert_eq!(authz.authorize(&req("a", "img", 10), "anyone", 0), SpawnDecision::Allow);
+        // Rate limit still bounds even the open case.
+        assert!(matches!(authz.authorize(&req("a", "img", 10), "anyone", 0), SpawnDecision::Deny(_)));
     }
 
     #[test]

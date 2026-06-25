@@ -148,21 +148,19 @@ pub struct FleetConfig {
     pub spawn: SpawnConfig,
 }
 
-/// The spawn control-plane config (#11). When `enabled`, the fleet supervisor subscribes to
+/// The spawn control-plane config (#11). A `kirby fleet` node ALWAYS listens for
 /// `KIND_KIRBY_SPAWN_REQUEST` (31003) on the relay and, for each verified+authorized request,
-/// spawns the agent on this node. The authz fields are the MVP gate (pops deferred): only an
-/// operator pubkey in `operators` may spawn, bounded by a per-requester rate limit, and only a
-/// pre-staged `image_ref` in `image_allowlist` is accepted (default-deny). DISABLED by default
-/// so a node never becomes an open spawn trigger by accident.
+/// spawns the agent on this node — listen-and-spawn is the node's purpose, not an opt-in
+/// (gudnuf). The authz fields are the MVP gate (pops deferred): `operators` is an OPTIONAL
+/// operator-pubkey allowlist bounded by a per-requester rate limit, and `image_allowlist`
+/// names the pre-staged images this node will run (default-deny an unknown image).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnConfig {
-    /// Whether this node accepts relay spawn requests. Default false (a bare fleet hosts only
-    /// its static tenants; nothing subscribes to spawn requests unless explicitly enabled).
-    #[serde(default)]
-    pub enabled: bool,
-    /// The operator pubkeys (hex) allowed to spawn (the three-keys operator key). A signed
-    /// event whose signer is not in this set is rejected — a signature proves WHICH key, not
-    /// WHETHER it may spawn. EMPTY denies everyone (so `enabled` without operators is inert).
+    /// The operator pubkeys (hex) allowed to spawn (the three-keys operator key). A signature
+    /// proves WHICH key signed, not WHETHER it may spawn. NON-EMPTY => enforce (only a listed
+    /// key may spawn). EMPTY => OPEN — accept any signer (the MVP DoS vector gudnuf explicitly
+    /// accepts until pops is the gate; the node logs a loud warning on startup). pops (pay-to-
+    /// spawn) replaces this allowlist as the real anti-spam gate, dropping into the same seam.
     #[serde(default)]
     pub operators: Vec<String>,
     /// The pre-staged genome `image_ref`s this node will run (default-deny an unknown image).
@@ -197,7 +195,6 @@ pub const fn default_spawn_max_seed_sats() -> u64 {
 impl Default for SpawnConfig {
     fn default() -> Self {
         SpawnConfig {
-            enabled: false,
             operators: Vec::new(),
             image_allowlist: Vec::new(),
             max_per_window: default_spawn_max_per_window(),
