@@ -94,6 +94,17 @@ pub struct KirbyConfig {
     /// carries the allocator base + the per-host tenant ceiling for now.
     #[serde(default)]
     pub fleet: FleetConfig,
+    /// The DURABLE state root that ALL persistent key + treasury material lives under
+    /// (FIX 2). The per-agent FROST keystore and the treasury counter resolve under this
+    /// root, so a custody key / balance survives a reboot. When unset (the default) the
+    /// node resolves a durable default at startup (`$XDG_DATA_HOME/kirby`, else
+    /// `$HOME/.local/share/kirby`); it is NEVER `std::env::temp_dir()` (a tmpfs `/tmp`
+    /// would silently destroy a sovereign key on reboot — the pre-fix bug). Set this to
+    /// pin an explicit durable directory (or, in tests, an explicit temp dir). At config
+    /// load this is exported to `$KIRBY_STATE_ROOT` for the free-function path helpers
+    /// ([`crate::boot::treasury_path_for`], [`crate::keyset_provisioning::keystore_dir_for`]).
+    #[serde(default)]
+    pub state_root: Option<PathBuf>,
 }
 
 /// The `[fleet]` config block (fleet-host S0): the knobs the fleet supervisor uses
@@ -220,6 +231,15 @@ pub struct IdentityConfig {
     /// D-9). Defaults to the parent dir of `key_path` when omitted.
     #[serde(default)]
     pub treasury_dir: Option<PathBuf>,
+    /// FIX 3 (FROST-tenant wiring): the per-agent FROST keystore dir the fleet supervisor
+    /// provisioned for THIS tenant. When `Some`, the agent's outward voice signs via its
+    /// sovereign 2-of-3 Q loaded from this keystore (the FROST branch in
+    /// [`crate::boot::build_nostr_actuator`]); when `None` (the single-agent default) the
+    /// voice signs with the node key (the byte-identical single-key path, G-CLEAN). The
+    /// supervisor sets this in `derive_tenant_config` so it survives serialization into the
+    /// child's `kirby.toml`; `agent_boot_config` reads it to build the child's `SocialConfig`.
+    #[serde(default)]
+    pub frost_keystore_dir: Option<PathBuf>,
 }
 
 impl IdentityConfig {
@@ -825,7 +845,22 @@ impl KirbyConfig {
         let cfg: KirbyConfig =
             toml::from_str(s).map_err(|e| anyhow::anyhow!("parse kirby config TOML: {e}"))?;
         cfg.validate()?;
+        cfg.apply_state_root_env();
         Ok(cfg)
+    }
+
+    /// Export `[node].state_root` (FIX 2) to `$KIRBY_STATE_ROOT` so the free-function path
+    /// helpers ([`crate::boot::treasury_path_for`], [`crate::keyset_provisioning::keystore_dir_for`])
+    /// resolve under the configured DURABLE root. A no-op when unset (the helpers then resolve
+    /// their own durable default — never temp_dir). Idempotent; safe to call on every config load.
+    pub fn apply_state_root_env(&self) {
+        if let Some(root) = &self.state_root {
+            // SAFETY: process-wide config bootstrap, before any agent/treasury work; single-threaded
+            // at this point in the run/agent/fleet entry paths.
+            unsafe {
+                std::env::set_var(crate::boot::STATE_ROOT_ENV, root);
+            }
+        }
     }
 
     /// Load a [`KirbyConfig`] from a TOML file path.

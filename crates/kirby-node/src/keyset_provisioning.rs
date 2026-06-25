@@ -71,13 +71,14 @@ const MIN_SIGNERS: u16 = 2;
 const MAX_SIGNERS: u16 = 3;
 
 /// The per-agent keystore directory beside the agent's treasury. Derived from the SAME
-/// state root as [`crate::boot::treasury_path_for`] (`std::env::temp_dir()` today), keyed
-/// by the tenant's `instance_id` (the same key the child's treasury path uses), so a
-/// tenant's keystore sits next to its treasury and is distinct per tenant.
+/// DURABLE state root as [`crate::boot::treasury_path_for`] (FIX 2: [`crate::boot::state_root`],
+/// NEVER `std::env::temp_dir()` — a custody key on a tmpfs `/tmp` is permanent loss on the
+/// next reboot), keyed by the tenant's `instance_id` (the same key the child's treasury path
+/// uses), so a tenant's keystore sits next to its treasury and is distinct per tenant.
 ///
-/// `<state>/kirby-keystore-<instance_id>/`
+/// `<durable-state-root>/keystore-<instance_id>/`
 pub fn keystore_dir_for(instance_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("kirby-keystore-{instance_id}"))
+    crate::boot::state_root().join(format!("keystore-{instance_id}"))
 }
 
 /// The group-pubkeys file path inside a keystore dir.
@@ -109,11 +110,47 @@ fn write_file_0600(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
+    // FIX 4 (symlink-safety, write side): refuse to write key material THROUGH a symlink. If a
+    // file already exists at `path`, lstat it (does not follow) and reject a symlink or any
+    // non-regular target — a planted symlink must not redirect a key WRITE to an attacker
+    // location. Combined with `O_NOFOLLOW` below this is belt-and-suspenders: lstat rejects an
+    // existing link with a clear message; O_NOFOLLOW makes the open itself fail (ELOOP) if the
+    // final component is a symlink even under a TOCTOU race.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                anyhow::bail!(
+                    "keystore file {} is a SYMLINK — refusing to write key material through a \
+                     link (planted-symlink redirect guard, FIX 4)",
+                    path.display()
+                );
+            }
+            if !ft.is_file() {
+                anyhow::bail!(
+                    "keystore file {} exists but is not a regular file — refusing to write key \
+                     material (FIX 4)",
+                    path.display()
+                );
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* fresh file; create below */ }
+        Err(e) => {
+            return Err(e).with_context(|| format!("lstat keystore file {}", path.display()))?;
+        }
+    }
+
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true).mode(0o600);
+    // `O_NOFOLLOW`: if the FINAL path component is a symlink, the open fails (ELOOP) instead of
+    // following it — closes the lstat→open TOCTOU window for the final component.
+    opts.write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
     let mut f = opts
         .open(path)
-        .with_context(|| format!("open keystore file {} (0600)", path.display()))?;
+        .with_context(|| format!("open keystore file {} (0600, O_NOFOLLOW)", path.display()))?;
     // `mode(0o600)` only applies on CREATE; force 0600 after open so a pre-existing
     // looser file is tightened before any secret bytes are written.
     f.set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -131,16 +168,33 @@ fn write_file_0600(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         .with_context(|| format!("write keystore file {}", path.display()))
 }
 
-/// Whether a keystore at `keystore_dir` is already provisioned: the group pubkeys file
-/// AND all 3 holder share files exist. A keystore is provisioned ATOMICALLY-ENOUGH for
-/// S3 (single host, single supervisor): a partially-written keystore (e.g. an interrupted
-/// first spawn) is treated as NOT provisioned and is regenerated. (For S3 a single
-/// supervisor provisions each tenant; concurrent provisioners are an S5/S6 concern.)
+/// Whether a keystore at `keystore_dir` is fully provisioned: the group pubkeys file AND
+/// all 3 holder share files exist. Used by the LOADER ([`load_quorum_signer_at`]) to refuse
+/// a partial keystore. The PROVISIONER no longer uses this to decide regeneration — see
+/// [`has_identity_anchor`] and FIX 1 (an established identity must NEVER be regenerated).
 fn is_provisioned(keystore_dir: &Path) -> bool {
     if !pubkeys_path(keystore_dir).is_file() {
         return false;
     }
     (1..=SHARE_COUNT).all(|idx| share_path(keystore_dir, idx).is_file())
+}
+
+/// Whether an ESTABLISHED IDENTITY ANCHOR is present: `group_pubkeys.json` exists.
+///
+/// FIX 1 (identity-loss, fail-closed): the regeneration decision keys off THIS anchor, NOT
+/// off "all files present". The anchor is the durable proof that a sovereign Q was once
+/// minted here. CRASH-SAFETY INVARIANT (see [`provision_keyset_at`]): first-spawn writes all
+/// 3 holder shares FIRST and the anchor LAST, so a SURVIVING anchor implies the shares were
+/// written. Therefore:
+///   * anchor present  => an established identity exists => NEVER regenerate. We LOAD it and
+///     fail LOUD if a share is missing/corrupt (a wrong-key sign or a silent new Q would be
+///     catastrophic identity/fund loss — the case the verifier empirically reproduced).
+///   * anchor absent    => a truly empty keystore (genuine first spawn) => generate fresh.
+///
+/// A missing share with a surviving anchor is therefore a LOUD ERROR ("restore the
+/// keystore"), never a silent regeneration of a new Q.
+fn has_identity_anchor(keystore_dir: &Path) -> bool {
+    pubkeys_path(keystore_dir).is_file()
 }
 
 /// Provision (or idempotently reload) a per-agent FROST keystore for the tenant keyed by
@@ -170,24 +224,46 @@ pub fn provision_keyset(instance_id: &str) -> anyhow::Result<FrostIdentity> {
 /// without colliding on the real per-instance path). The instance-keyed wrapper is the
 /// production entry point.
 pub fn provision_keyset_at(keystore_dir: &Path) -> anyhow::Result<FrostIdentity> {
-    // IDEMPOTENT RELOAD: an already-provisioned keystore is the agent's durable identity;
-    // load it (same Q) and return WITHOUT touching any file. No regeneration on restart.
-    if is_provisioned(keystore_dir) {
+    // FIX 1 (identity-loss, FAIL-CLOSED): the regeneration decision keys off the IDENTITY
+    // ANCHOR (`group_pubkeys.json`), NOT off "all files present". If the anchor exists an
+    // established sovereign Q was once minted here, so we NEVER regenerate: we reload it and
+    // VALIDATE all 3 holder shares, failing LOUD if any is missing/corrupt. (The old code
+    // required pubkeys AND all 3 shares; a missing share with a surviving anchor fell through
+    // to regeneration and SILENTLY MINTED A NEW Q — permanent identity/fund loss, the case
+    // the verifier empirically reproduced. This is now a loud, recoverable error.)
+    if has_identity_anchor(keystore_dir) {
         let id = FrostIdentity::load(&pubkeys_path(keystore_dir)).with_context(|| {
             format!(
-                "reload existing FROST keystore {} (idempotent restart)",
+                "reload established FROST identity anchor {} (idempotent restart). The anchor \
+                 (group_pubkeys.json) exists, so a sovereign Q was already minted here and MUST \
+                 NOT be regenerated.",
+                keystore_dir.display()
+            )
+        })?;
+        // FAIL-CLOSED on a partial keystore: validate that all 3 holder shares are present and
+        // loadable. A surviving anchor with a missing/corrupt share is a CATASTROPHIC state
+        // (the agent cannot sign as itself); refuse loudly and tell the operator to restore the
+        // keystore — NEVER mint a new Q over an established identity.
+        assert_shares_loadable(keystore_dir).with_context(|| {
+            format!(
+                "established FROST identity at {} has a missing or corrupt holder share. The \
+                 identity anchor (group_pubkeys.json) is present, so this agent ALREADY OWNS a \
+                 sovereign Q — refusing to regenerate (that would mint a NEW key and permanently \
+                 lose this identity + its funds). RESTORE the keystore (all 3 share_N.json) from \
+                 backup.",
                 keystore_dir.display()
             )
         })?;
         tracing::info!(
             npub = %id.npub(),
             keystore = %keystore_dir.display(),
-            "reloaded per-agent FROST keystore (idempotent; same sovereign Q across restart)"
+            "reloaded established per-agent FROST keystore (idempotent; same sovereign Q across restart; 3/3 shares validated)"
         );
         return Ok(id);
     }
 
-    // FIRST SPAWN: the supervisor is the trusted dealer.
+    // FIRST SPAWN (no identity anchor => a truly empty keystore): the supervisor is the
+    // trusted dealer.
     std::fs::create_dir_all(keystore_dir).with_context(|| {
         format!("create per-agent FROST keystore dir {}", keystore_dir.display())
     })?;
@@ -198,21 +274,16 @@ pub fn provision_keyset_at(keystore_dir: &Path) -> anyhow::Result<FrostIdentity>
     let keyset = kirby_custody::generate_dealer_keyset(MIN_SIGNERS, MAX_SIGNERS)
         .map_err(|e| anyhow::anyhow!("trusted-dealer 2-of-3 keygen: {e}"))?;
 
-    // (2a) Persist the PUBLIC half (the group PublicKeyPackage) so FrostIdentity reloads
-    //      to the same Q/npub on restart. This file holds NO secret material, but we tighten
-    //      it to 0600 too: the whole keystore dir is owner-only (a uniform, defensive posture
-    //      so nothing in it is ever group/world-readable), even though the pubkeys are public.
-    let pubkeys_file = pubkeys_path(keystore_dir);
-    frost_identity::save_pubkeys(&keyset.pubkeys, &pubkeys_file)
-        .context("persist FROST group pubkeys (the public identity face)")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&pubkeys_file, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 group pubkeys {}", pubkeys_file.display()))?;
-    }
+    // CRASH-SAFETY ORDERING INVARIANT (FIX 1): write all 3 holder SHARES FIRST, and the
+    // identity ANCHOR (`group_pubkeys.json`) LAST. The anchor is what the regeneration
+    // decision keys off, so a SURVIVING ANCHOR MUST IMPLY THE SHARES WERE WRITTEN. If we wrote
+    // the anchor first and crashed before the shares, a restart would see the anchor, refuse to
+    // regenerate (correct), but then fail-closed on the missing shares — turning a recoverable
+    // first-spawn crash into an operator-restore. Writing shares-then-anchor means a crash
+    // BEFORE the anchor leaves NO anchor => the next spawn cleanly regenerates (no identity was
+    // ever established); a crash AFTER the anchor means the shares are already on disk.
 
-    // (2b) Persist each holder's KeyPackage (the SECRET signing share) 0600, named by its
+    // (1a) Persist each holder's KeyPackage (the SECRET signing share) 0600 FIRST, named by its
     //      identifier (share_1/2/3.json). The KeyPackages are derived from the keyset's
     //      SecretShares; both they and the keyset are ZeroizeOnDrop and are wiped when this
     //      scope ends. serde-feature serialization matches the custody cosign bin exactly.
@@ -235,6 +306,21 @@ pub fn provision_keyset_at(keystore_dir: &Path) -> anyhow::Result<FrostIdentity>
         // `kps` (KeyPackages, ZeroizeOnDrop) drops here, wiping the secret shares it held.
     }
 
+    // (1b) Persist the PUBLIC half (the group PublicKeyPackage) so FrostIdentity reloads to the
+    //      same Q/npub on restart. THIS IS THE ANCHOR, written LAST (crash-safety invariant
+    //      above). This file holds NO secret material, but we tighten it to 0600 too: the whole
+    //      keystore dir is owner-only (a uniform, defensive posture), even though pubkeys are
+    //      public.
+    let pubkeys_file = pubkeys_path(keystore_dir);
+    frost_identity::save_pubkeys(&keyset.pubkeys, &pubkeys_file)
+        .context("persist FROST group pubkeys (the identity anchor; written LAST)")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&pubkeys_file, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 group pubkeys {}", pubkeys_file.display()))?;
+    }
+
     // (3) Derive the agent's PUBLIC identity (Q + npub) from the persisted public package.
     let identity = FrostIdentity::from_pubkeys(keyset.pubkeys.clone(), &pubkeys_path(keystore_dir))
         .context("derive FROST identity (Q + npub) from the freshly provisioned group")?;
@@ -242,7 +328,7 @@ pub fn provision_keyset_at(keystore_dir: &Path) -> anyhow::Result<FrostIdentity>
     tracing::info!(
         npub = %identity.npub(),
         keystore = %keystore_dir.display(),
-        "provisioned NEW per-agent FROST keystore (trusted-dealer 2-of-3; the agent is born with sovereign Q)"
+        "provisioned NEW per-agent FROST keystore (trusted-dealer 2-of-3; shares-then-anchor; the agent is born with sovereign Q)"
     );
 
     // (4) ZEROIZE: drop the dealer keyset. Its SecretShares are ZeroizeOnDrop, so the
@@ -300,6 +386,25 @@ pub fn load_quorum_signer_at(keystore_dir: &Path) -> anyhow::Result<QuorumSigner
         .context("build co-located QuorumSigner from the persisted keystore")
 }
 
+/// FIX 1 (fail-closed): validate that all 3 holder shares are present AND deserialize as
+/// `KeyPackage`s. Called when an established identity anchor is found, so a partial/corrupt
+/// keystore over an established Q is a LOUD error rather than a silent regeneration. Does NOT
+/// build a signer (no combined-secret materialization); just proves each share loads. The
+/// shares it reads are dropped immediately (ZeroizeOnDrop) — no lingering copy.
+fn assert_shares_loadable(keystore_dir: &Path) -> anyhow::Result<()> {
+    for idx in 1..=SHARE_COUNT {
+        let path = share_path(keystore_dir, idx);
+        if !path.is_file() {
+            anyhow::bail!("holder share_{idx} missing at {}", path.display());
+        }
+        let bytes = read_share_file(&path)?;
+        let _kp: KeyPackage = serde_json::from_slice(&bytes)
+            .with_context(|| format!("deserialize holder KeyPackage {}", path.display()))?;
+        // `_kp` (ZeroizeOnDrop) drops here, wiping the share scalar it held.
+    }
+    Ok(())
+}
+
 /// Read a holder share file, bounding the read (a share KeyPackage JSON is well under a
 /// KiB) and rejecting a non-regular file -- the same MED hardening `FrostIdentity::load`
 /// applies to the pubkeys file, so a hostile/mistaken keystore path (a huge file, a
@@ -310,9 +415,21 @@ fn read_share_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     /// A holder KeyPackage hex/JSON is well under a KiB; this generous cap bounds the read.
     const MAX_SHARE_BYTES: u64 = 256 * 1024;
 
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat holder share {}", path.display()))?;
-    if !meta.is_file() {
+    // FIX 4 (symlink-safety): stat with `symlink_metadata` (does NOT follow a final symlink)
+    // and reject anything that is not a REGULAR FILE — a planted symlink under the keystore
+    // path must not redirect a key READ to (or through) an attacker-chosen target. `metadata()`
+    // resolves through symlinks; `symlink_metadata` reports the link itself.
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("lstat holder share {}", path.display()))?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        anyhow::bail!(
+            "holder share {} is a SYMLINK — refusing to read key material through a link \
+             (planted-symlink redirect guard, FIX 4)",
+            path.display()
+        );
+    }
+    if !ft.is_file() {
         anyhow::bail!("holder share {} is not a regular file", path.display());
     }
     if meta.len() > MAX_SHARE_BYTES {
@@ -323,12 +440,23 @@ fn read_share_file(path: &Path) -> anyhow::Result<Vec<u8>> {
             MAX_SHARE_BYTES
         );
     }
-    // Tighten a pre-existing looser file to 0600 before reading (defensive; a share must
-    // never be world-readable on a shared box).
+    // FIX 5 (reload perms fail-closed): tighten a pre-existing looser file to 0600 before
+    // reading. If the chmod FAILS, surface the error — do NOT silently proceed to read a secret
+    // share that may still be world/group-readable. (The old code ignored the result with `let
+    // _ =`.) We only reach here on a confirmed regular, non-symlink file (FIX 4), so the chmod
+    // cannot be redirected through a link.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "chmod 0600 holder share {} before reading (refusing to read a secret share \
+                     with wrong permissions, FIX 5)",
+                    path.display()
+                )
+            },
+        )?;
     }
     std::fs::read(path).with_context(|| format!("read holder share {}", path.display()))
 }
@@ -509,6 +637,109 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         println!("G-KEYSTORE-PERMS PASS: all 3 holder KeyPackage files are 0600");
+    }
+
+    /// FIX 1 (CATASTROPHIC case, fail-closed): an ESTABLISHED keystore (identity anchor +
+    /// shares) with ONE holder share deleted must make `provision_keyset_at` FAIL LOUD — it must
+    /// NOT silently regenerate a NEW Q. This is the exact silent-key-regeneration the adversarial
+    /// verifier empirically reproduced: a surviving `group_pubkeys.json` with a missing share
+    /// previously fell through to regeneration, minting a new sovereign key and permanently losing
+    /// the agent's identity + funds. We assert (a) provisioning ERRORS, (b) the surviving anchor
+    /// is UNTOUCHED (the original Q is preserved on disk for an operator restore), and (c) the
+    /// surviving shares are byte-identical (no regeneration occurred).
+    #[test]
+    fn provision_fails_closed_on_missing_share_over_established_anchor() {
+        let dir = temp_keystore("failclosed");
+
+        // Establish an identity: full keystore (anchor + 3 shares), capture the original Q.
+        let id1 = provision_keyset_at(&dir).expect("first spawn establishes the identity");
+        let q1 = id1.q_bytes();
+        let anchor_before = std::fs::read(pubkeys_path(&dir)).expect("read anchor before");
+        let surviving_shares_before: Vec<(u16, Vec<u8>)> = [1u16, 3u16]
+            .into_iter()
+            .map(|idx| (idx, std::fs::read(share_path(&dir, idx)).expect("read surviving share")))
+            .collect();
+
+        // Catastrophe: delete ONE holder share, leaving the identity anchor intact.
+        std::fs::remove_file(share_path(&dir, 2)).expect("delete share 2");
+
+        // FAIL-CLOSED: provisioning over an established anchor with a missing share must ERROR,
+        // never regenerate.
+        // `.map(|_| ())` drops the Ok payload (FrostIdentity isn't Debug) so `expect_err` works.
+        let err = provision_keyset_at(&dir)
+            .map(|_| ())
+            .expect_err("a missing share over an established anchor MUST fail closed, not regenerate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing or corrupt") || msg.to_lowercase().contains("restore"),
+            "the error must tell the operator to restore the keystore, got: {msg}"
+        );
+
+        // The identity anchor is UNTOUCHED — no new Q was minted over the established identity.
+        let anchor_after = std::fs::read(pubkeys_path(&dir)).expect("read anchor after");
+        assert_eq!(anchor_before, anchor_after, "the identity anchor must NOT be rewritten (no regen)");
+        let reloaded = FrostIdentity::load(&pubkeys_path(&dir)).expect("anchor still loads");
+        assert_eq!(reloaded.q_bytes(), q1, "the original sovereign Q must be preserved (no new key)");
+
+        // The surviving shares were NOT rewritten (no regeneration cycle ran).
+        for (idx, before) in &surviving_shares_before {
+            let after = std::fs::read(share_path(&dir, *idx)).expect("read surviving share after");
+            assert_eq!(before, &after, "surviving share_{idx} must be byte-identical (no regen)");
+        }
+        // The deleted share is still absent (we did not silently re-mint it under a new key).
+        assert!(!share_path(&dir, 2).exists(), "the missing share must stay missing (fail closed, not regen)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!(
+            "FIX-1 FAIL-CLOSED PASS: missing share over an established anchor errors loudly; \
+             original Q preserved; NO new key minted"
+        );
+    }
+
+    /// FIX 4 (symlink-safety): a planted SYMLINK at a share path is rejected on read (the loader
+    /// refuses to read key material through a link), so a hostile symlink cannot redirect a key
+    /// read to an attacker-chosen target.
+    #[test]
+    #[cfg(unix)]
+    fn read_share_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_keystore("symlink");
+        provision_keyset_at(&dir).expect("provision");
+
+        // Replace share_1 with a symlink to share_3 (a benign target; the point is the link is
+        // rejected regardless of where it points).
+        let s1 = share_path(&dir, 1);
+        std::fs::remove_file(&s1).expect("remove real share 1");
+        symlink(share_path(&dir, 3), &s1).expect("plant symlink at share 1");
+
+        let err = read_share_file(&s1).expect_err("a symlinked share must be rejected");
+        assert!(
+            format!("{err:#}").to_uppercase().contains("SYMLINK"),
+            "the error must name the symlink rejection, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("FIX-4 PASS: a symlinked share path is rejected on read");
+    }
+
+    /// FIX 4 (symlink-safety, write side): `write_file_0600` refuses to write key material
+    /// through a pre-existing symlink (so a planted link can't redirect a key WRITE).
+    #[test]
+    #[cfg(unix)]
+    fn write_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_keystore("writesymlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("decoy.txt");
+        let link = dir.join("share_planted.json");
+        symlink(&target, &link).expect("plant symlink");
+        let err = write_file_0600(&link, b"secret").expect_err("writing through a symlink must be rejected");
+        assert!(
+            format!("{err:#}").to_uppercase().contains("SYMLINK"),
+            "the write error must name the symlink rejection, got: {err:#}"
+        );
+        assert!(!target.exists(), "no bytes must have been written through the link");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("FIX-4 PASS (write): writing key material through a symlink is rejected");
     }
 
     /// A loader over a NOT-provisioned (or partial) keystore refuses cleanly (no panic), so a

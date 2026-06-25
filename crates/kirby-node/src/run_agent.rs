@@ -459,11 +459,15 @@ fn agent_boot_config(
                 &cfg.identity.treasury_dir(),
             )),
             cost_sats: crate::config::DEFAULT_POST_COST_SATS,
-            // Single-key path by default: a bare `kirby run` signs notes with its node key. A
-            // FROST tenant (S3d) sets this to its provisioned keystore dir so its voice signs via
-            // its sovereign 2-of-3 Q (see `build_nostr_actuator`'s FROST branch); `None` here keeps
-            // the byte-identical single-key path (G-CLEAN).
-            frost_keystore_dir: None,
+            // FIX 3 (FROST-tenant wiring): read the provisioned keystore dir from the child's
+            // config. A FROST tenant's `derive_tenant_config` (fleet_supervisor.rs) set
+            // `identity.frost_keystore_dir = Some(<keystore>)`, which survives serialization into
+            // this child's `kirby.toml`; here it flows into `SocialConfig.frost_keystore_dir` so
+            // `build_nostr_actuator` takes the FROST branch and the voice signs via the sovereign
+            // 2-of-3 Q. A bare `kirby run`/`kirby agent` leaves it `None`, keeping the
+            // byte-identical single-key path (G-CLEAN). (Previously hardcoded `None`, so the FROST
+            // branch was dead in the real flow — the gap three reviews flagged.)
+            frost_keystore_dir: cfg.identity.frost_keystore_dir.clone(),
         }),
         _ => None,
     };
@@ -832,6 +836,7 @@ mod tests {
             identity: IdentityConfig {
                 key_path: root.join("node.key"),
                 treasury_dir: Some(root.clone()),
+                frost_keystore_dir: None,
             },
             relay: RelayConfig {
                 url: "ws://127.0.0.1:7777".to_string(),
@@ -852,6 +857,7 @@ mod tests {
             agent_id: "agent-0".to_string(),
             node_id: "node-1".to_string(),
             fleet: Default::default(),
+            state_root: None,
         }
     }
 
@@ -864,6 +870,7 @@ mod tests {
         let identity = crate::config::IdentityConfig {
             key_path: PathBuf::from("/var/lib/kirby/node.nostr.key"),
             treasury_dir: None,
+            frost_keystore_dir: None,
         };
 
         // Unset => pinned to the resolved identity key (the SAME resolution the run uses).

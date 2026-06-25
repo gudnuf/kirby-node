@@ -90,6 +90,14 @@ fn tenant(agent_id: &str, sats: u64) -> TenantConfig {
 /// isolation comes from distinct paths, not from no lock at all.
 #[test]
 fn g_tenant_isolation_db_per_agent_treasuries_are_independent() {
+    // FIX 2: `treasury_path_for_agent` now resolves under the DURABLE state root (no longer
+    // temp_dir). Pin that root to a unique temp dir for this test so it never writes into the
+    // operator's real data dir. The per-agent subpaths are unique, so a process-wide set is safe.
+    let test_root = std::env::temp_dir().join(format!("kirby-s2-test-{}", std::process::id()));
+    // SAFETY: test-only bootstrap before any treasury work in this single-threaded test entry.
+    unsafe {
+        std::env::set_var(kirby_node::boot::STATE_ROOT_ENV, &test_root);
+    }
     // Unique per-run agent ids so the temp treasury paths do not collide across test runs.
     let suffix = format!(
         "{}-{}",

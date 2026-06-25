@@ -324,10 +324,56 @@ async fn build_nostr_actuator(
     Ok(Arc::new(actuator))
 }
 
-/// The per-node treasury store path (the daemon-owned counter, D-9). A per-node temp
-/// store keeps two node processes distinct on one host.
+/// The env var that overrides the durable state root (set from `[node].state_root` at
+/// config load, and set by tests to an explicit temp dir). Documented as the seam between
+/// the config field and the free-function path helpers below (which have no config handle).
+pub const STATE_ROOT_ENV: &str = "KIRBY_STATE_ROOT";
+
+/// The DURABLE state root all persistent key/treasury material lives under.
+///
+/// FIX 2 (durability): key material and the treasury counter MUST NOT live under
+/// `std::env::temp_dir()` -- on a host with a tmpfs `/tmp` that is permanent loss of a
+/// sovereign key on the next reboot. This resolves a durable root, in order:
+///   1. `$KIRBY_STATE_ROOT` (set from the `[node].state_root` config field at load, and by
+///      tests to an explicit temp dir). The configurable knob.
+///   2. `$XDG_DATA_HOME/kirby` (the XDG durable data location).
+///   3. `$HOME/.local/share/kirby` (the XDG default when `$XDG_DATA_HOME` is unset).
+///   4. LAST RESORT (LOUD): `./.kirby-state` under the CWD -- still durable (it survives a
+///      reboot), never temp_dir. Warns so the operator sets a real root.
+///
+/// `std::env::temp_dir()` is NEVER used for key/treasury material (it was the pre-fix bug).
+pub fn state_root() -> PathBuf {
+    if let Ok(v) = std::env::var(STATE_ROOT_ENV) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        let xdg = xdg.trim();
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("kirby");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim();
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".local/share/kirby");
+        }
+    }
+    tracing::warn!(
+        "KIRBY_STATE_ROOT/XDG_DATA_HOME/HOME all unset; falling back to ./.kirby-state for \
+         DURABLE key + treasury material. This is still reboot-durable (NOT temp_dir), but set \
+         [node].state_root (or $KIRBY_STATE_ROOT) to a real data directory."
+    );
+    PathBuf::from(".kirby-state")
+}
+
+/// The per-node treasury store path (the daemon-owned counter, D-9). A per-node store
+/// under the DURABLE [`state_root`] keeps two node processes distinct on one host AND
+/// survives a reboot (FIX 2: NEVER temp_dir for the treasury counter).
 pub(crate) fn treasury_path_for(node_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("kirby-treasury-{node_id}"))
+    state_root().join(format!("treasury-{node_id}"))
 }
 
 /// The per-AGENT treasury store path (fleet-host S0, spec 2.1): DB-per-agent, so each
@@ -337,8 +383,9 @@ pub(crate) fn treasury_path_for(node_id: &str) -> PathBuf {
 /// `kirby run` is unchanged; only a fleet supervisor reaches for this per-agent path.
 /// Agent-keyed TREES inside one sled were rejected (spec 2.1): they would re-serialize
 /// every tenant behind one lock, re-introducing the coupling DB-per-agent avoids.
+/// Under the DURABLE [`state_root`] (FIX 2: NEVER temp_dir for treasury material).
 pub fn treasury_path_for_agent(agent_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("kirby-treasury-agent-{agent_id}"))
+    state_root().join(format!("treasury-agent-{agent_id}"))
 }
 
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet

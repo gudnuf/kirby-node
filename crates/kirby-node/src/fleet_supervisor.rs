@@ -85,6 +85,11 @@ pub struct TenantLaunchSpec {
     pub treasury_path: PathBuf,
     /// This tenant's initial treasury balance (play-money, seeded on first create).
     pub initial_sats: u64,
+    /// FIX 3 (FROST-tenant wiring): the per-agent FROST keystore dir the supervisor
+    /// provisioned for this tenant (its sovereign 2-of-3 Q). Threaded into the child via
+    /// `derive_tenant_config` -> `identity.frost_keystore_dir`, so the launched tenant's voice
+    /// signs with its OWN Q (the FROST branch in `build_nostr_actuator`), not the node key.
+    pub frost_keystore_dir: PathBuf,
 }
 
 /// A handle to a launched tenant, the lifecycle the supervisor monitors. Object-safe so the
@@ -318,6 +323,9 @@ impl FleetSupervisor {
             allocation: allocation.clone(),
             treasury_path: treasury_path.clone(),
             initial_sats: tenant.initial_sats,
+            // FIX 3: carry the provisioned keystore into the child so its voice signs via its
+            // sovereign Q (threaded into `identity.frost_keystore_dir` in derive_tenant_config).
+            frost_keystore_dir: keystore_dir.clone(),
         };
         let process = self
             .launcher
@@ -472,6 +480,15 @@ impl ProcessTenantLauncher {
         // `<dir>/node.nostr.key`, so each tenant gets a distinct npub (and, via the §F3 one-key
         // invariant, its own memory key too).
         cfg.identity.key_path = self.config_dir.join(format!("keys-{}", spec.allocation.instance_id));
+        // FIX 3 (FROST-tenant wiring) — RIGHT ALONGSIDE PR #36's per-tenant `key_path` above:
+        // both are per-tenant isolations keyed by instance_id and they COEXIST. The node key_path
+        // (above) roots presence/memory; the FROST keystore (here) roots the OUTWARD VOICE. Set
+        // the child's `identity.frost_keystore_dir` to the supervisor-provisioned keystore so the
+        // launched tenant signs published notes via its sovereign 2-of-3 Q (the FROST branch in
+        // `build_nostr_actuator`), NOT the node key. Without this the child hardcoded `None` and
+        // signed with the node key — the FROST branch was dead in the real flow (the gap three
+        // reviews flagged). This survives serialization into the child's `kirby.toml`.
+        cfg.identity.frost_keystore_dir = Some(spec.frost_keystore_dir.clone());
         // A tenant child is a plain single-agent `kirby agent`; it must NOT inherit the fleet
         // tenant list (no recursive fleets).
         cfg.fleet = crate::config::FleetConfig::default();
@@ -619,6 +636,14 @@ mod tests {
         "#;
         let mut cfg = KirbyConfig::from_toml_str(toml).expect("base config");
         cfg.fleet.tenants = tenants;
+        // FIX 2: pin the DURABLE state root (treasury + keystore) to a STABLE per-binary temp
+        // dir for the fleet tests, set ONCE here (not mid-test), so a test that provisions real
+        // keystores via `launch_all` never pollutes the operator's real data dir AND no test
+        // mutates `$KIRBY_STATE_ROOT` mid-run (which would race a sibling test's path recompute).
+        // The per-instance subdirs are unique, so one shared root is safe across these tests.
+        let root = std::env::temp_dir().join("kirby-fleet-test-state");
+        cfg.state_root = Some(root.clone());
+        cfg.apply_state_root_env();
         cfg
     }
 
@@ -696,6 +721,9 @@ mod tests {
     /// distinct sovereign Qs.
     #[tokio::test]
     async fn supervisor_provisions_per_agent_frost_keyset_at_spawn() {
+        // FIX 2: the DURABLE state root is pinned to a stable per-binary temp dir by
+        // `base_config_with_tenants` (set ONCE, not mid-test), so this test's real keystores
+        // never pollute the operator's data dir and no env race with sibling tests occurs.
         // Unique agent ids per test run so the instance-keyed keystore dirs do not collide with
         // other tests/runs sharing the temp dir.
         let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
@@ -919,11 +947,13 @@ mod tests {
             instance_id: "kirby-bob".into(),
             gateway_port: 9001,
         };
+        let keystore_a = std::env::temp_dir().join("kirby-keystore-kirby-alice");
         let spec_a = TenantLaunchSpec {
             agent_id: "alice".into(),
             allocation: alloc_a,
             treasury_path: crate::boot::treasury_path_for_agent("alice"),
             initial_sats: 333_000,
+            frost_keystore_dir: keystore_a.clone(),
         };
         let cfg_a = launcher.derive_tenant_config(&spec_a);
         assert_eq!(cfg_a.agent_id, "alice");
@@ -931,15 +961,37 @@ mod tests {
         assert_eq!(cfg_a.funding.initial_sats, 333_000);
         assert!(cfg_a.fleet.tenants.is_empty(), "the child must not inherit the tenant list");
 
+        // FIX 3 (the gap-catching assertion): a derived FROST-tenant child config MUST carry
+        // `identity.frost_keystore_dir = Some(<keystore>)` so that `agent_boot_config` builds a
+        // `SocialConfig` with `frost_keystore_dir = Some(...)`, which makes `build_nostr_actuator`
+        // take the FROST branch (the voice signs via the sovereign 2-of-3 Q, not the node key).
+        // Before FIX 3 the child hardcoded `None` and this wiring was absent — the FROST branch
+        // was dead in the real flow. This unit assertion on derive_tenant_config catches a
+        // regression of that gap without a VM.
+        assert_eq!(
+            cfg_a.identity.frost_keystore_dir.as_deref(),
+            Some(keystore_a.as_path()),
+            "the FROST-tenant child must carry its provisioned keystore dir (else its voice signs \
+             with the node key, not its sovereign Q — the FROST branch would be dead)"
+        );
+
         // Two tenants derive DISTINCT node_ids => distinct treasury paths (the isolation
         // property the DB-per-agent design guarantees, G-TENANT-ISOLATION).
+        let keystore_b = std::env::temp_dir().join("kirby-keystore-kirby-bob");
         let spec_b = TenantLaunchSpec {
             agent_id: "bob".into(),
             allocation: alloc_b,
             treasury_path: crate::boot::treasury_path_for_agent("bob"),
             initial_sats: 333_000,
+            frost_keystore_dir: keystore_b.clone(),
         };
         let cfg_b = launcher.derive_tenant_config(&spec_b);
+        // FIX 3: distinct tenants thread DISTINCT keystores (each its own sovereign Q).
+        assert_eq!(cfg_b.identity.frost_keystore_dir.as_deref(), Some(keystore_b.as_path()));
+        assert_ne!(
+            cfg_a.identity.frost_keystore_dir, cfg_b.identity.frost_keystore_dir,
+            "two FROST tenants must thread DISTINCT keystores (distinct sovereign Qs)"
+        );
         assert_ne!(cfg_a.node_id, cfg_b.node_id, "two tenants must derive distinct node_ids");
         assert_ne!(
             crate::boot::treasury_path_for(&cfg_a.node_id),

@@ -58,6 +58,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         identity: IdentityConfig {
             key_path: state.join("node.nostr.key"),
             treasury_dir: Some(state.clone()),
+            frost_keystore_dir: None,
         },
         relay: RelayConfig {
             url: test_relay(),
@@ -80,6 +81,9 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         agent_id: format!("agent-{test}"),
         node_id: format!("node-{test}-{}", std::process::id()),
         fleet: Default::default(),
+        // FIX 2: pin the durable state root to this test's temp state dir (the gated VM run
+        // would otherwise write the treasury under the durable default; tests stay sandboxed).
+        state_root: Some(state),
     }
 }
 
