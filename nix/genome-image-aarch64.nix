@@ -118,6 +118,12 @@ let
       cp ${prunedCargoLock} Cargo.lock
       # Remove the kirby-node member line from the workspace members list.
       ${pkgs.gnused}/bin/sed -i '/"crates\/kirby-node",/d' Cargo.toml
+      # Remove the kirby-custody member line too: the FROST custody crate is the
+      # host daemon's (it derives per-agent identities + signs); the genome +
+      # kirby-proto subgraph is custody-free, so dropping the member keeps the
+      # offline genome build a pure function of its own closure (and means
+      # custody's deps, e.g. ureq/tungstenite, are never resolved for the image).
+      ${pkgs.gnused}/bin/sed -i '/"crates\/kirby-custody",/d' Cargo.toml
       # Remove the cdk/cashu/bip39 workspace.dependencies lines (the host daemon's,
       # not the genome's) so cargo does not try to fetch them offline.
       ${pkgs.gnused}/bin/sed -i '/^cdk\( \|-\)/d;/^cashu /d' Cargo.toml

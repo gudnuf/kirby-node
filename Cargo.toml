@@ -4,6 +4,7 @@ members = [
     "crates/kirby-node",
     "crates/kirby-proto",
     "crates/kirby-genome",
+    "crates/kirby-custody",
 ]
 
 [workspace.package]

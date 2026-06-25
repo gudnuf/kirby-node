@@ -1,0 +1,36 @@
+[package]
+name = "kirby-custody"
+version = "0.1.0"
+edition = "2021"
+description = "Kirby custody backbone (C-1): ZF frost-secp256k1-tr 2-of-3 taproot threshold custody scaffold"
+license = "MIT"
+
+[dependencies]
+# D-15: crate base is official ZF frost-secp256k1-tr 3.0.0 (NOT bifrost-rs).
+# Ships the Secp256K1Sha256TR taproot ciphersuite, trusted-dealer keygen,
+# and (for later chunks) sign_with_tweak / aggregate_with_tweak + keys::refresh.
+# serde feature: lets the wire types (SigningCommitments / SigningPackage /
+# SignatureShare) serialize as opaque CoSignEvent payloads over the D-14 seam (C-6).
+frost-secp256k1-tr = { version = "3.0.0", features = ["serde"] }
+# rust-bitcoin: BIP-341 taproot tweak + address (the load-bearing C-1 surface).
+bitcoin = "0.32"
+# CSPRNG for the trusted dealer (rand_core 0.6 compatible with frost-core).
+rand = "0.8"
+# C-3 spend path: a real Rust HTTP client for esplora (fetch/broadcast/confirm)
+# and the faucet, JSON for the esplora responses + keyset persistence, hex for
+# the frost serializations.
+ureq = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+# block_on for driving the async RelayAdapter seam in same-host tests (C-6); no
+# full async runtime needed (single-threaded executor).
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+# SPLIT FROST -> Nostr co-sign harness (additive, binary frost-nostr-cosign):
+# sha2 for the NIP-01 event id, bech32 for the npub, tungstenite (no TLS, plain
+# ws:// only) for publishing the signed event to a relay. sha2/bech32 are already
+# in the tree transitively; pinned here as direct deps. tungstenite default-features
+# is off so NO native-tls/openssl is pulled (keeps the musl static build clean).
+sha2 = "0.10"
+bech32 = "0.11"
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
