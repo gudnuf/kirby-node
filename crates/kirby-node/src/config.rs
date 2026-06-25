@@ -50,21 +50,21 @@ pub struct KirbyConfig {
     /// The v0 workload the agent runs once alive. Defaults to [`Workload::AppCheckpoint`].
     #[serde(default)]
     pub workload: Workload,
-    /// The `[brain]` knobs for the MIND workload (brain-stub). Used only when
-    /// `workload = "brain"`; defaults so a bare `[brain]` (or none) runs.
+    /// The `[brain]` knobs for the capable agent's THINK (the `Completion` rail). Used only
+    /// when `workload = "capable"`; defaults so a bare `[brain]` (or none) runs.
     #[serde(default)]
     pub brain: BrainConfig,
-    /// The `[memory]` knobs for the durable-mind-state workload (Chunk-1 stub). Used
-    /// only when `workload = "memory"`; defaults so a bare `[memory]` (or none) runs.
+    /// The `[memory]` knobs for the capable agent's durable mind-state (the `Memory` ACT).
+    /// Used only when `workload = "capable"`; defaults so a bare `[memory]` (or none) runs.
     #[serde(default)]
     pub memory: MemoryConfig,
-    /// The `[diarist]` knobs for the DIARIST workload (the persistent journaler). Used
-    /// only when `workload = "diarist"`; defaults so a bare `[diarist]` (or none) runs.
-    /// The diarist's inference is configured by `[brain]` and its store by `[memory]`
-    /// (it REUSES both verbatim); this block carries only the diarist-specific cadence
-    /// and recall depth.
+    /// The `[agent]` knobs for the CAPABLE workload (the agentic kernel). Defaults so a
+    /// bare `[agent]` (or none) runs. The agent's inference is configured by `[brain]`
+    /// and its store by `[memory]` (it REUSES both verbatim); this block carries only the
+    /// agent-specific loop cadence and recall depth (the cmdline still carries them as the
+    /// existing `kirby.diarist_*` keys).
     #[serde(default)]
-    pub diarist: DiaristConfig,
+    pub agent: AgentConfig,
     /// The `[meter]` knobs: the synthetic VM-rent burn rates (CPU + memory + egress).
     /// Defaults match [`crate::meter::BurnRates::default`] so existing runs are
     /// unchanged; a deploy LOWERS the memory rate so an always-on VM does not drain its
@@ -368,41 +368,15 @@ pub enum Workload {
     #[serde(rename = "app-checkpoint")]
     #[default]
     AppCheckpoint,
-    /// The MIND workload (brain-stub): the genome runs a think -> pay -> meter ->
-    /// repeat loop, issuing a brokered `Completion` act each tick. Thinking drains
-    /// the treasury (the stub debits a deterministic simulated cost), so the agent
-    /// dies when broke. Stub-first behind the daemon's `BrainBackend` seam (no real
-    /// money, no network); the brain only thinks (no checkpoint, no other acts).
-    Brain,
-    /// The durable-mind-state workload (memory-stub, Chunk-1): the genome runs a
-    /// scripted SET/GET/LS/RM loop issuing a brokered `Memory` act, the SIBLING of the
-    /// brain's `Completion`. WRITES drain the treasury by a host-computed storage cost;
-    /// READS are free. Stub-first behind the daemon's `MemoryBackend` seam (no crypto,
-    /// no relay); the real NIP-AE engram store swaps in at Chunk-2.
-    Memory,
-    /// The DIARIST workload (the first PERSISTENT Kirby): the genome runs ONE
-    /// mission-loop per tick — RECALL its recent journal (`Memory` GET/LS, free) ->
-    /// THINK one reflection (`Completion` via the brain) -> REMEMBER it (`Memory` SET,
-    /// encrypted-to-self) -> BEACON (the daemon's automatic nerve presence) -> sleep.
-    /// It is a genome-side COMPOSITION of the two acts the daemon already performs:
-    /// `brain = Some` selects the `Completion` rail (`CompositeRail`, stub or routstr)
-    /// and `memory = Some` injects the `Memory` backend (StubMemory or the real
-    /// EngramStore), and the allowlist holds BOTH sentinels. No new daemon act, rail,
-    /// metering, crypto, or nerve code — only this config wiring + the genome module.
-    /// THINK is the life-gating act: when the treasury can no longer cover a think the
-    /// genome parks and the daemon halts the VM (earn-or-die applied to the mind, F4).
-    Diarist,
-    /// The CAPABLE workload (the agentic kernel, build-spec slice 1): the genome runs ONE
-    /// PLAN, ACT, VERIFY, learn iteration per tick. It is the diarist that learned to ACT and
-    /// then CHECK: it PLANs one decision (`Completion` via the brain, the life-gating act),
-    /// ACTs on its OWN durable memory (at most one `Memory` SET into `mem/capable/...`, guarded
-    /// genome-side), VERIFYs the effect (a free `Memory` GET read-back), and learns (feeds the
-    /// verified verdict into the next plan). The new muscle is SELF-CORRECTION: a read-back
-    /// mismatch is detected and surfaced for a retry. Like the diarist it is a genome-side
-    /// COMPOSITION of the two acts the daemon already performs and REUSES the `[brain]`,
-    /// `[memory]`, and `[diarist]` config (same allowlist, same cmdline knobs), so it needs no
-    /// new daemon act, rail, metering, crypto, or nerve code. THINK is the life-gating act
-    /// (earn-or-die, F4).
+    /// The CAPABLE workload (the agentic kernel): the genome runs ONE PLAN, ACT, VERIFY, learn
+    /// iteration per tick. It PLANs one decision (`Completion` via the brain, the life-gating
+    /// act), ACTs on its OWN durable memory (at most one `Memory` SET into `mem/capable/...`,
+    /// guarded genome-side), VERIFYs the effect (a free `Memory` GET read-back), and learns
+    /// (feeds the verified verdict into the next plan). The new muscle is SELF-CORRECTION: a
+    /// read-back mismatch is detected and surfaced for a retry. It is a genome-side COMPOSITION
+    /// of the two acts the daemon already performs and REUSES the `[brain]`, `[memory]`, and
+    /// `[agent]` config (same allowlist, same cmdline knobs), so it needs no new daemon act,
+    /// rail, metering, crypto, or nerve code. THINK is the life-gating act (earn-or-die, F4).
     Capable,
 }
 
@@ -411,9 +385,6 @@ impl Workload {
     pub fn genome_workload(self) -> &'static str {
         match self {
             Workload::AppCheckpoint => "app-checkpoint",
-            Workload::Brain => "brain",
-            Workload::Memory => "memory",
-            Workload::Diarist => "diarist",
             Workload::Capable => "capable",
         }
     }
@@ -422,26 +393,9 @@ impl Workload {
     pub fn submits_checkpoint(self) -> bool {
         match self {
             Workload::AppCheckpoint => true,
-            // The brain only thinks; it submits no app checkpoint (durable
-            // mind-state is a named later chunk, not this stub).
-            Workload::Brain => false,
-            // Chunk-2: the memory workload checkpoint-persists its monotonic write-seq
-            // (`wseq`) so a restart does NOT reset it to 0 and false-dedupe a new write
-            // against the persistent ledger (the F1 bug on a durable store, design doc
-            // §16 fold #1). The genome submits a wseq blob; the daemon serves it back on
-            // resume (the run-agent restore path); the daemon's wseq_floor (R2-7) is the
-            // authoritative backstop.
-            Workload::Memory => true,
-            // The diarist persists its journal through the SAME wseq-keyed Memory write
-            // (REMEMBER), so it checkpoint-persists the monotonic `seq` exactly as the
-            // memory workload does: a restart continues PAST the last entry rather than
-            // re-issuing an old write key (the F1 false-dedupe) or an old think key (the
-            // F2 collision). The diarist drives BOTH its think and its write keys off
-            // this one checkpointed `seq`.
-            Workload::Diarist => true,
             // The capable loop persists its monotonic `seq` through the SAME wseq-keyed Memory
-            // write (the ACT) exactly as the diarist/memory workloads do, so a restart continues
-            // PAST the last entry rather than re-issuing an old write/think key (F1/F2).
+            // write (the ACT), so a restart continues PAST the last entry rather than re-issuing
+            // an old write/think key (F1/F2).
             Workload::Capable => true,
         }
     }
@@ -467,7 +421,7 @@ pub enum BrainBackendKind {
 /// genome reads `model`, `max_cost_sats`, and `tick_secs` from the kernel command
 /// line (the daemon writes them when the workload is `brain`); the daemon's
 /// `StubBrain` reads `bytes_per_sat` (its simulated-cost knob). Every field has a
-/// sane default so a bare `[brain]` (or none, when `workload = "brain"`) runs.
+/// sane default so a bare `[brain]` (or none, when `workload = "capable"`) runs.
 ///
 /// This is the swap-ready surface: `RoutstrBrain` reads the SAME `model` and per-call
 /// `max_cost_sats`, so pointing the agent at a real model is a config change, not a
@@ -569,9 +523,9 @@ impl Default for BrainConfig {
 /// The `[memory]` config block (memory-stub, Chunk-1): the knobs for the durable-mind-
 /// state workload. The genome reads `max_cost_sats` (its per-WRITE ceiling) and
 /// `tick_secs` (the op cadence) from the kernel command line (the daemon writes them when
-/// the workload is `memory`); the daemon's `StubMemory` reads `bytes_per_sat` (its
+/// the workload is `capable`); the daemon's `StubMemory` reads `bytes_per_sat` (its
 /// host-computed storage-cost knob). Every field has a sane default so a bare `[memory]`
-/// (or none, when `workload = "memory"`) runs.
+/// (or none, when `workload = "capable"`) runs.
 ///
 /// This is the swap-ready surface: the real `EngramStore` (Chunk-2) reads the SAME
 /// `max_cost_sats` ceiling, so pointing the agent at the real nerve-backed store is a
@@ -667,37 +621,37 @@ pub struct SocialConfig {
 /// spam) without dominating the think cost (which stays the death gate). Tunable post-MVP.
 pub const DEFAULT_POST_COST_SATS: u64 = 1;
 
-/// The `[diarist]` config block (the persistent journaler): the ONLY diarist-specific
-/// knobs. The diarist's inference backend is `[brain]` (model, backend, max_cost_sats,
-/// the routstr fields) and its store is `[memory]` (relays, key_path, max_cost_sats) —
-/// reused verbatim, no nesting — so the daemon passes `cfg.brain`/`cfg.memory` straight
-/// through. This block adds only the loop cadence and the recall depth. Every field
-/// defaults so a bare `[diarist]` (or none, when `workload = "diarist"`) runs.
+/// The `[agent]` config block (the capable agent): the ONLY agent-loop-specific knobs.
+/// The agent's inference backend is `[brain]` (model, backend, max_cost_sats, the routstr
+/// fields) and its store is `[memory]` (relays, key_path, max_cost_sats) — reused verbatim,
+/// no nesting — so the daemon passes `cfg.brain`/`cfg.memory` straight through. This block
+/// adds only the loop cadence and the recall depth. Every field defaults so a bare `[agent]`
+/// (or none) runs. (The cmdline still carries these as the existing `kirby.diarist_*` keys.)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DiaristConfig {
-    /// Seconds the diarist sleeps between ticks (the ONE think+remember cadence). This
-    /// OVERRIDES `[brain].tick_secs` / `[memory].tick_secs` for the diarist workload
-    /// (which become unused — the diarist has a single loop, not two).
-    #[serde(default = "default_diarist_tick_secs")]
+pub struct AgentConfig {
+    /// Seconds the agent sleeps between ticks (the ONE plan+act cadence). This OVERRIDES
+    /// `[brain].tick_secs` / `[memory].tick_secs` for the capable workload (which become
+    /// unused — the agent has a single loop, not two).
+    #[serde(default = "default_agent_tick_secs")]
     pub tick_secs: u64,
-    /// How many recent journal entries to RECALL (a free `Memory` LS + GET) into each
-    /// reflection prompt, so the diarist thinks WITH its recent past, not blind.
-    #[serde(default = "default_diarist_recall_count")]
+    /// How many recent facts to RECALL (a free `Memory` LS + GET) into each plan prompt, so
+    /// the agent reasons WITH its recent past, not blind.
+    #[serde(default = "default_agent_recall_count")]
     pub recall_count: usize,
 }
 
-fn default_diarist_tick_secs() -> u64 {
+fn default_agent_tick_secs() -> u64 {
     60
 }
-fn default_diarist_recall_count() -> usize {
+fn default_agent_recall_count() -> usize {
     5
 }
 
-impl Default for DiaristConfig {
+impl Default for AgentConfig {
     fn default() -> Self {
-        DiaristConfig {
-            tick_secs: default_diarist_tick_secs(),
-            recall_count: default_diarist_recall_count(),
+        AgentConfig {
+            tick_secs: default_agent_tick_secs(),
+            recall_count: default_agent_recall_count(),
         }
     }
 }
@@ -926,13 +880,12 @@ impl KirbyConfig {
         if self.funding.initial_sats == 0 {
             anyhow::bail!("funding.initial_sats must be > 0 (the agent needs a budget to live)");
         }
-        // The brain must be able to afford at least one think, or it dies before it
-        // thinks once: a zero per-call cap is always DENIED_OVER_BUDGET, and a cap
-        // above the treasury is always DENIED_INSUFFICIENT_TREASURY (D-20). The DIARIST
-        // thinks too (its THINK is the same `Completion`, the life-gating act), and it
-        // reuses `[brain]`, so it gets the SAME guard — a diarist that cannot afford its
-        // first think is a config error caught at load, not a born-then-instantly-dead VM.
-        if matches!(self.workload, Workload::Brain | Workload::Diarist | Workload::Capable) {
+        // The capable agent must be able to afford at least one think, or it dies before it
+        // thinks once: a zero per-call cap is always DENIED_OVER_BUDGET, and a cap above the
+        // treasury is always DENIED_INSUFFICIENT_TREASURY (D-20). Its THINK is a `Completion`
+        // (the life-gating act) and it reuses `[brain]`, so a capable agent that cannot afford
+        // its first think is a config error caught at load, not a born-then-instantly-dead VM.
+        if matches!(self.workload, Workload::Capable) {
             if self.brain.max_cost_sats == 0 {
                 anyhow::bail!(
                     "brain.max_cost_sats must be > 0 (a zero per-call cap means every think is DENIED_OVER_BUDGET)"
@@ -975,34 +928,30 @@ impl KirbyConfig {
                 }
             }
         }
-        // The durable-mind-state agent must be able to afford at least one WRITE, or it
-        // can recall (reads are free) but never FORM a memory: a zero per-write ceiling is
-        // always DENIED_OVER_BUDGET. The DIARIST also REMEMBERs through the Memory write
-        // and reuses `[memory]`, so it gets the SAME guard (F5: the diarist validation
-        // must apply BOTH the brain and the memory ceiling check, else every REMEMBER is
-        // DENIED_OVER_BUDGET — a config error). (No <= initial_sats check: reads stay
-        // free, so a broke agent still lives; the write cost is host-computed per op.)
-        if matches!(self.workload, Workload::Memory | Workload::Diarist | Workload::Capable)
-            && self.memory.max_cost_sats == 0
-        {
+        // The capable agent must be able to afford at least one WRITE (its ACT), or it can
+        // recall (reads are free) but never FORM a memory: a zero per-write ceiling is always
+        // DENIED_OVER_BUDGET. It ACTs through the Memory write and reuses `[memory]`, so it
+        // gets the SAME guard (F5: the capable validation must apply BOTH the brain and the
+        // memory ceiling check, else every WRITE is DENIED_OVER_BUDGET — a config error).
+        // (No <= initial_sats check: reads stay free, so a broke agent still lives; the write
+        // cost is host-computed per op.)
+        if matches!(self.workload, Workload::Capable) && self.memory.max_cost_sats == 0 {
             anyhow::bail!(
                 "memory.max_cost_sats must be > 0 (a zero per-write ceiling means every write is DENIED_OVER_BUDGET)"
             );
         }
-        // The diarist demo is BOOTSTRAP-ONLY. A diarist `resume` currently boots, confirms the
+        // The capable demo is BOOTSTRAP-ONLY. A capable `resume` currently boots, confirms the
         // checkpoint restore, and tears down WITHOUT entering the metered loop (run_agent::
         // run_resume) — so the FLOOR-HALT death mechanism, which is armed only inside the
-        // metered run, never arms. A resumed diarist would be a deathless agent: it could fall
-        // below the per-think floor (unable to afford another thought) yet never be halted.
+        // metered run, never arms. A resumed capable agent would be a deathless agent: it could
+        // fall below the per-think floor (unable to afford another thought) yet never be halted.
         // Reject the combination cleanly at load rather than silently running that zombie.
-        // Metered-resume for the diarist is a follow-up; lifting this guard is part of it.
-        if matches!(self.workload, Workload::Diarist | Workload::Capable)
-            && self.mode == RunMode::Resume
-        {
+        // Metered-resume for the capable agent is a follow-up; lifting this guard is part of it.
+        if matches!(self.workload, Workload::Capable) && self.mode == RunMode::Resume {
             anyhow::bail!(
-                "workload = \"{}\" does not support mode = \"resume\" yet: the diarist/capable \
-                 demos are bootstrap-only (a resumed agent skips the metered loop and never arms \
-                 its floor-halt death mechanism). Use mode = \"bootstrap\"; metered-resume is a \
+                "workload = \"{}\" does not support mode = \"resume\" yet: the capable demo is \
+                 bootstrap-only (a resumed agent skips the metered loop and never arms its \
+                 floor-halt death mechanism). Use mode = \"bootstrap\"; metered-resume is a \
                  follow-up.",
                 self.workload.genome_workload()
             );
@@ -1271,7 +1220,7 @@ mod tests {
     #[test]
     fn brain_zero_max_cost_sats_is_rejected() {
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1293,7 +1242,7 @@ mod tests {
     #[test]
     fn brain_max_cost_sats_over_treasury_is_rejected() {
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1321,7 +1270,7 @@ mod tests {
         // initial_sats) must PASS validation — proving the guard rejects only the bad
         // shapes above, not the brain workload unconditionally.
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1333,7 +1282,7 @@ mod tests {
             max_cost_sats = 64
         "#;
         let cfg = KirbyConfig::from_toml_str(toml).expect("a valid brain config must validate");
-        assert_eq!(cfg.workload, Workload::Brain);
+        assert_eq!(cfg.workload, Workload::Capable);
         assert_eq!(cfg.brain.max_cost_sats, 64, "the brain block parsed");
     }
 
@@ -1348,7 +1297,7 @@ mod tests {
         let toml = |mode: &str| {
             format!(
                 r#"
-                workload = "diarist"
+                workload = "capable"
                 mode = "{mode}"
                 genome_image = {{ path = "/tmp/k/img" }}
                 [identity]
@@ -1375,7 +1324,7 @@ mod tests {
         // diarist + bootstrap => validates (the guard rejects only the unsupported mode).
         let cfg = KirbyConfig::from_toml_str(&toml("bootstrap"))
             .expect("a diarist bootstrap config must validate");
-        assert_eq!(cfg.workload, Workload::Diarist);
+        assert_eq!(cfg.workload, Workload::Capable);
         assert_eq!(cfg.mode, RunMode::Bootstrap);
     }
 
@@ -1389,7 +1338,7 @@ mod tests {
         // An existing `[brain]` block with no `backend` key parses as Stub, and the
         // routstr-only fields are NOT required (backcompat: a stub brain still runs).
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1408,7 +1357,7 @@ mod tests {
     #[test]
     fn brain_routstr_missing_node_url_is_rejected() {
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1432,7 +1381,7 @@ mod tests {
     #[test]
     fn brain_routstr_missing_mint_url_is_rejected() {
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1456,7 +1405,7 @@ mod tests {
     #[test]
     fn brain_routstr_missing_wallet_db_path_is_rejected() {
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1481,7 +1430,7 @@ mod tests {
     fn brain_routstr_plain_http_nonlocal_node_is_rejected() {
         // A non-localhost node MUST be https (the X-Cashu bearer must not cross plaintext).
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1508,7 +1457,7 @@ mod tests {
         // The negative control: a well-formed routstr brain (https node + all fields)
         // PASSES, proving the guards reject only the bad shapes, not routstr wholesale.
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1538,7 +1487,7 @@ mod tests {
         // Plain http is allowed ONLY for a loopback node (a same-host node / the Layer-B
         // test rig), so the mock-node tests can run without TLS.
         let toml = r#"
-            workload = "brain"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1592,7 +1541,7 @@ mod tests {
     #[test]
     fn diarist_config_parses_with_defaults() {
         let toml = r#"
-            workload = "diarist"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1606,15 +1555,15 @@ mod tests {
             max_cost_sats = 64
         "#;
         let cfg = KirbyConfig::from_toml_str(toml).expect("a valid diarist config must validate");
-        assert_eq!(cfg.workload, Workload::Diarist);
-        assert_eq!(cfg.workload.genome_workload(), "diarist");
+        assert_eq!(cfg.workload, Workload::Capable);
+        assert_eq!(cfg.workload.genome_workload(), "capable");
         assert!(
             cfg.workload.submits_checkpoint(),
-            "the diarist persists its wseq cursor for resume continuity"
+            "the capable agent persists its wseq cursor for resume continuity"
         );
-        // The [diarist] block defaulted (none present).
-        assert_eq!(cfg.diarist.tick_secs, 60);
-        assert_eq!(cfg.diarist.recall_count, 5);
+        // The [agent] block defaulted (none present).
+        assert_eq!(cfg.agent.tick_secs, 60);
+        assert_eq!(cfg.agent.recall_count, 5);
     }
 
     /// FIX-1 (config reachability): the daemon CONFIG path can boot the capable loop, not only
@@ -1672,7 +1621,7 @@ mod tests {
     #[test]
     fn diarist_block_parses_explicit_knobs() {
         let toml = r#"
-            workload = "diarist"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1684,13 +1633,13 @@ mod tests {
             max_cost_sats = 64
             [memory]
             max_cost_sats = 64
-            [diarist]
+            [agent]
             tick_secs = 90
             recall_count = 8
         "#;
-        let cfg = KirbyConfig::from_toml_str(toml).expect("a valid diarist config must validate");
-        assert_eq!(cfg.diarist.tick_secs, 90);
-        assert_eq!(cfg.diarist.recall_count, 8);
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a valid agent config must validate");
+        assert_eq!(cfg.agent.tick_secs, 90);
+        assert_eq!(cfg.agent.recall_count, 8);
     }
 
     /// F5 (the brain half): a diarist whose brain cannot afford a think is rejected for THE
@@ -1698,7 +1647,7 @@ mod tests {
     #[test]
     fn diarist_zero_brain_cap_is_rejected() {
         let toml = r#"
-            workload = "diarist"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1724,7 +1673,7 @@ mod tests {
     #[test]
     fn diarist_zero_memory_cap_is_rejected() {
         let toml = r#"
-            workload = "diarist"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1749,7 +1698,7 @@ mod tests {
     #[test]
     fn diarist_routstr_missing_node_url_is_rejected() {
         let toml = r#"
-            workload = "diarist"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1777,7 +1726,7 @@ mod tests {
     #[test]
     fn diarist_valid_config_is_accepted() {
         let toml = r#"
-            workload = "diarist"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"
@@ -1791,7 +1740,7 @@ mod tests {
             max_cost_sats = 64
         "#;
         let cfg = KirbyConfig::from_toml_str(toml).expect("a valid diarist config must validate");
-        assert_eq!(cfg.workload, Workload::Diarist);
+        assert_eq!(cfg.workload, Workload::Capable);
         assert_eq!(cfg.brain.max_cost_sats, 64);
         assert_eq!(cfg.memory.max_cost_sats, 64);
     }
@@ -1822,7 +1771,7 @@ mod tests {
     #[test]
     fn meter_block_tunes_memory_rent() {
         let toml = r#"
-            workload = "diarist"
+            workload = "capable"
             genome_image = { path = "/tmp/k/img" }
             [identity]
             key_path = "/tmp/k/node.key"

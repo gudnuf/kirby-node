@@ -101,12 +101,12 @@ pub struct BootConfig {
     /// genome-side knobs (`max_cost_sats`, `tick_secs`) to the genome on the kernel
     /// command line. `None` for every other workload (no memory backend, no memory cmdline).
     pub memory: Option<crate::config::MemoryConfig>,
-    /// The `[diarist]` knobs for the DIARIST workload. `Some` only when
-    /// `workload = Some("diarist")`, alongside BOTH `brain` and `memory` being `Some` (the
-    /// diarist composes the `Completion` rail + the `Memory` backend on one gateway). It
+    /// The `[agent]` knobs for the CAPABLE workload. `Some` only when
+    /// `workload = Some("capable")`, alongside BOTH `brain` and `memory` being `Some` (the
+    /// capable agent composes the `Completion` rail + the `Memory` backend on one gateway). It
     /// carries the loop cadence + recall depth to the genome on the kernel command line
     /// (`kirby.diarist_*=`), the same way the brain/memory knobs travel. `None` otherwise.
-    pub diarist: Option<crate::config::DiaristConfig>,
+    pub agent: Option<crate::config::AgentConfig>,
     /// The outward-actuator config (the agent's voice). `Some` only for the `capable` workload:
     /// `boot_and_observe` builds a `NostrActuator` from it (node identity key + the relay set) and
     /// attaches it to the `CompositeRail` (`with_actuator`), so an `Act::Actuate` is signed +
@@ -559,9 +559,9 @@ pub async fn boot_and_observe_with_rail(
         brain: config.brain.clone(),
         // The memory knobs travel the same way (`kirby.memory_*=` when Some).
         memory: config.memory.clone(),
-        // The diarist cadence/recall knobs travel the same way (`kirby.diarist_*=` when Some).
-        // `DiaristConfig` is `Copy`, so this copies (no clone needed).
-        diarist: config.diarist,
+        // The agent cadence/recall knobs travel the same way (`kirby.diarist_*=` when Some).
+        // `AgentConfig` is `Copy`, so this copies (no clone needed).
+        agent: config.agent,
         lockdown_egress: config.lockdown_egress,
         snapshot_capable: config.snapshot_capable,
     };

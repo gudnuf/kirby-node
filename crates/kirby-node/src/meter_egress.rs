@@ -28,6 +28,15 @@ use std::time::Duration;
 /// for bpfel-unknown-none), embedded so it travels with the daemon.
 pub const EGRESS_BPF_OBJECT: &[u8] = include_bytes!(env!("KIRBY_EGRESS_BPF_OBJECT"));
 
+/// The "~0 IP bytes left the TAP" ceiling for G4 (spec 7). The genome's denied
+/// egress attempt is a handful of unanswered SYN/ARP/DNS packets (well under a
+/// KiB even with TCP SYN retransmits over the probe window); a flowing connection
+/// would be kilobytes of payload and more. 8 KiB is a generous ceiling that still
+/// separates "blocked" from "leaked" by orders of magnitude. Shared by the G4
+/// full-loop test so the bar is one number. (Lives here, the kept eBPF-meter
+/// module, after the standalone `egress` demo subcommand was removed.)
+pub const EBPF_ZERO_CEILING_BYTES: u64 = 8192;
+
 /// The map name and program name in the eBPF object (must match the kernel crate).
 const EGRESS_MAP: &str = "EGRESS_BYTES";
 const EGRESS_PROG: &str = "kirby_egress";

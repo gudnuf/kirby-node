@@ -434,7 +434,7 @@ async fn boot_active_genome(
         workload: Some("snapshot".to_string()),
         brain: None,
         memory: None,
-        diarist: None,
+        agent: None,
         lockdown_egress: false,
         snapshot_capable: true,
     };

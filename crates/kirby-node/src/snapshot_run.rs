@@ -474,7 +474,7 @@ async fn boot_node1(
         workload: config.boot.workload.clone(),
         brain: config.boot.brain.clone(),
         memory: config.boot.memory.clone(),
-        diarist: config.boot.diarist,
+        agent: config.boot.agent,
         lockdown_egress: config.boot.lockdown_egress,
         snapshot_capable: config.boot.snapshot_capable,
     };

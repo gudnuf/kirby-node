@@ -268,7 +268,7 @@ impl SandboxBackend for FirecrackerBackend {
             workload: spec.workload.clone(),
             brain: spec.brain.clone(),
             memory: spec.memory.clone(),
-            diarist: spec.diarist,
+            agent: spec.agent,
             vcpu_count: spec.vcpu_count,
             mem_size_mib: spec.mem_size_mib,
             jail_uid: uid,
@@ -329,11 +329,11 @@ pub(crate) struct BootParams {
     /// command line (`kirby.memory_*=`) so the genome's memory loop reads its config,
     /// exactly as the brain knobs travel.
     pub memory: Option<crate::config::MemoryConfig>,
-    /// The `[diarist]` knobs for the DIARIST workload. `Some` only for a `diarist` guest:
+    /// The `[agent]` knobs for the CAPABLE workload. `Some` only for a `capable` guest:
     /// `tick_secs` and `recall_count` are written onto the kernel command line
-    /// (`kirby.diarist_*=`) so the genome's diarist loop reads its cadence + recall depth,
+    /// (`kirby.diarist_*=`) so the genome's capable loop reads its cadence + recall depth,
     /// exactly as the brain/memory knobs travel.
-    pub diarist: Option<crate::config::DiaristConfig>,
+    pub agent: Option<crate::config::AgentConfig>,
     /// vCPU count and memory for the microVM. Small for the spike.
     pub vcpu_count: u8,
     pub mem_size_mib: usize,
@@ -688,16 +688,17 @@ pub(crate) async fn boot(
             memory.max_cost_sats, memory.tick_secs
         ));
     }
-    // The diarist cadence + recall depth for the DIARIST workload: the genome's diarist
-    // loop reads its OWN tick (the one think+remember cadence, overriding the now-unused
-    // brain/memory ticks) and how many recent entries to RECALL, the same non-secret way
-    // the brain/memory knobs travel. For a diarist guest, `brain` and `memory` are ALSO
-    // Some, so all three blocks ride together; the diarist loop reads brain_model/
-    // brain_max_cost_sats (THINK) + memory_max_cost_sats (REMEMBER) + these two.
-    if let Some(diarist) = &params.diarist {
+    // The agent cadence + recall depth for the CAPABLE workload: the genome's capable
+    // loop reads its OWN tick (the one plan+act cadence, overriding the now-unused
+    // brain/memory ticks) and how many recent facts to RECALL, the same non-secret way
+    // the brain/memory knobs travel. For a capable guest, `brain` and `memory` are ALSO
+    // Some, so all three blocks ride together; the capable loop reads brain_model/
+    // brain_max_cost_sats (THINK) + memory_max_cost_sats (ACT) + these two. The cmdline
+    // keys stay `kirby.diarist_*` (the genome's existing cmdline contract).
+    if let Some(agent) = &params.agent {
         boot_args.push_str(&format!(
             " kirby.diarist_tick_secs={} kirby.diarist_recall_count={}",
-            diarist.tick_secs, diarist.recall_count
+            agent.tick_secs, agent.recall_count
         ));
     }
 

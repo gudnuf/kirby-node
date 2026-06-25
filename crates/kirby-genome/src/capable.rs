@@ -58,7 +58,7 @@ use kirby_proto::{
 use prost::Message as _;
 
 use super::{boot_log, idle_forever, redial};
-use crate::diarist::{
+use crate::metabolism::{
     classify_remember, classify_think, diarist_params_from_cmdline, DiaristParams, RememberOutcome,
     ThinkOutcome,
 };

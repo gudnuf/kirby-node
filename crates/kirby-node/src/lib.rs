@@ -67,13 +67,16 @@
 //!   awaits the perform step (the order and the treasury economics are unchanged).
 //! - [`mint_rig`]: build and fund a `cdk::Wallet` against the mint (the rail's
 //!   credential), shared by the rail and the G5 test.
-//! - [`brokered_run`]: boot the VM with the real rail injected, let the genome
-//!   issue a `RequestCapability` ecash settle over vsock, and gather the G5
-//!   evidence (the daemon authorized + performed it, cost_sats debited, treasury
-//!   dropped by exactly that, and the guest raw-egress proof held). Linux proves
-//!   raw-egress absence with the eBPF TAP meter; macOS VZ's MVP proves it
-//!   structurally by booting a vsock-only guest with no network device. The mint is
-//!   booted in the G5 test (cdk-mintd, dev-only).
+//! - The G5 brokered-act path: boot the VM with the real rail injected, let the genome
+//!   issue a `RequestCapability` ecash settle over vsock, and assert the G5 evidence
+//!   (the daemon authorized + performed it, cost_sats debited, treasury dropped by
+//!   exactly that, and the guest raw-egress proof held). Linux proves raw-egress
+//!   absence with the eBPF TAP meter; macOS VZ's MVP proves it structurally by booting
+//!   a vsock-only guest with no network device. The mint is booted in the G5 test
+//!   (cdk-mintd, dev-only). (The standalone `brokered`/`egress` demo subcommands and
+//!   their `brokered_run`/`egress_run` orchestration modules were removed when Kirby
+//!   collapsed to the single `capable` agent; the G5/G4 invariants are now proven by
+//!   the kept full-loop test.)
 //!
 //! C-7 adds snapshot + cross-node resume (spec D-8, 4.1, section 5 transfer seam,
 //! gate G6), the spike's hardest seam:
@@ -137,7 +140,8 @@
 //!   node 2 (D-9), so the resumed gateway's STEP 1 dedupe (`gateway::GatewayService::
 //!   authorize_capability`) reads K's entry across the move and short-circuits. C-10
 //!   PROVES the persistence (D-9) + the dedupe (C-3) + the resume (C-7) compose.
-//! - [`idempotent_run`]: the G9 orchestration. Node 1 boots the genome with the
+//! - The G9 orchestration (the removed `idempotent_run` module; the invariant is now
+//!   proven by the kept full-loop test). Node 1 boots the genome with the
 //!   `idempotent` workload (issue K -> PERFORMED, cost C), snapshots + transfers +
 //!   KILLS node 1; node 2 restores from the snapshot and opens the SAME persisted
 //!   treasury; the genome detects the resume (the bumped VMGenID generation) and
@@ -171,16 +175,12 @@
 
 pub mod app_checkpoint_run;
 pub mod boot;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub mod brokered_run;
 pub mod checkpoint;
 pub mod config;
 // EngramStore crypto/addressing/LWW (durable mind-state Chunk-2). Platform-agnostic
 // (host-side nostr-sdk + crypto), like `nerve`/`rail` -- NOT cfg-gated, so the
 // cross-platform `rail::EngramStore` can reference it on macOS too.
 pub mod engram;
-#[cfg(target_os = "linux")]
-pub mod egress_run;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
 pub mod fleet;
@@ -211,8 +211,6 @@ pub mod gateway;
 // WakeRequest + the agent-scoped path helper. Platform-agnostic host-side serde
 // types (no genome/trait/sudo surface), like `nerve`/`engram` -- NOT cfg-gated.
 pub mod hibernate;
-#[cfg(target_os = "linux")]
-pub mod idempotent_run;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod meter;
 #[cfg(target_os = "linux")]

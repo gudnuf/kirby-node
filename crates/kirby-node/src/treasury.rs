@@ -49,8 +49,8 @@ pub enum TreasuryError {
 /// kind, so the stable discriminator is that message. Any other storage error
 /// (corruption, a real I/O fault) is NOT lock contention and must not be retried.
 ///
-/// Lives here (platform-independent — it only inspects a `TreasuryError`) so both
-/// the Linux-only `idempotent_run` retry loop and the cross-platform `boot`
+/// Lives here (platform-independent — it only inspects a `TreasuryError`) so the
+/// Linux-only orchestration retry loops and the cross-platform `boot`
 /// treasury-reopen retry can share it without dragging Linux orchestration onto
 /// macOS.
 pub(crate) fn is_lock_contention(err: &TreasuryError) -> bool {

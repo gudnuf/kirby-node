@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kirby_node::boot::{BootConfig, ImagePaths};
-use kirby_node::config::{BrainConfig, DiaristConfig, MemoryConfig};
+use kirby_node::config::{AgentConfig, BrainConfig, MemoryConfig};
 use kirby_node::gateway::{GatewayService, Session};
 use kirby_node::metered_run::{self, MeteredRunConfig, Terminated};
 use kirby_node::rail::{
@@ -446,9 +446,9 @@ async fn capable_vm_boots_plans_acts_verifies_and_dies_when_broke() {
         max_cost_sats: 256, // a generous per-write ceiling (host cost stays well under it)
         ..MemoryConfig::default()
     };
-    // The capable workload reuses the diarist cadence/recall cmdline knobs (slice 1, no new
+    // The capable workload reuses the agent cadence/recall cmdline knobs (slice 1, no new
     // daemon plumbing): `tick_secs` drives the loop cadence, `recall_count` the RECALL depth.
-    let diarist = DiaristConfig { tick_secs: 1, recall_count: 3 };
+    let agent = AgentConfig { tick_secs: 1, recall_count: 3 };
 
     let boot = BootConfig {
         image,
@@ -468,10 +468,10 @@ async fn capable_vm_boots_plans_acts_verifies_and_dies_when_broke() {
         hello_timeout: Duration::from_secs(40),
         workload: Some("capable".to_string()),
         // `Some(brain)` selects the CompositeRail(StubBrain); `Some(memory)` injects StubMemory;
-        // `Some(diarist)` carries the cadence/recall knobs onto the genome cmdline (reused).
+        // `Some(agent)` carries the cadence/recall knobs onto the genome cmdline (reused).
         brain: Some(brain),
         memory: Some(memory),
-        diarist: Some(diarist),
+        agent: Some(agent),
         social: None,
         lockdown_egress: false,
         snapshot_capable: false,

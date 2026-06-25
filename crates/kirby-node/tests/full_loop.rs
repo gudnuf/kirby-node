@@ -138,7 +138,7 @@ async fn c11_full_loop_one_genome_survives_a_failover() {
         eprintln!("  fingerprint_post = {post}");
     }
 
-    let ebpf_zero_ceiling = kirby_node::egress_run::EBPF_ZERO_CEILING_BYTES;
+    let ebpf_zero_ceiling = kirby_node::meter_egress::EBPF_ZERO_CEILING_BYTES;
 
     // ---- STEP 1 (G1): BOOT. The genome booted under the jailer and round-tripped. ----
     assert!(

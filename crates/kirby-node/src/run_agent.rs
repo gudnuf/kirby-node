@@ -430,35 +430,13 @@ fn agent_boot_config(
     // allowlist is EXCLUSIVELY the memory sentinel (it can reach nothing else), and the
     // `[memory]` knobs ride to the genome via the cmdline. The StubMemory backend is
     // injected onto the gateway in `boot_and_observe` when `boot.memory` is Some.
-    // The DIARIST is the both-acts workload: its allowlist holds BOTH sentinels and it
-    // carries `brain` + `memory` + `diarist`, so `boot_and_observe` builds the Completion
+    // The CAPABLE agent is the both-acts workload: its allowlist holds BOTH sentinels and it
+    // carries `brain` + `memory` + `agent`, so `boot_and_observe` builds the Completion
     // rail (CompositeRail, stub or routstr) AND injects the Memory backend on ONE gateway,
-    // and all three cmdline blocks travel. This is the only config-wiring the diarist needs
-    // (no new daemon act/rail/metering/nerve code — the two acts compose on orthogonal seams).
-    let (allow, brain, memory, diarist) = match cfg.workload {
-        Workload::Brain => (
-            vec![crate::rail::BRAIN_COMPLETION_DESTINATION.to_string()],
-            Some(cfg.brain.clone()),
-            None,
-            None,
-        ),
-        Workload::Memory => (
-            vec![crate::rail::MEMORY_DESTINATION.to_string()],
-            None,
-            Some(cfg.memory.clone()),
-            None,
-        ),
-        Workload::Diarist => (
-            vec![
-                crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
-                crate::rail::MEMORY_DESTINATION.to_string(),
-            ],
-            Some(cfg.brain.clone()),
-            // F3: enforce the ONE-key invariant by construction — pin the journal's
-            // EngramStore key to the NODE IDENTITY key when the operator left it unset.
-            Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
-            Some(cfg.diarist),
-        ),
+    // and all three cmdline blocks travel. This is the only config-wiring the capable agent
+    // needs (no new daemon act/rail/metering/nerve code — the two acts compose on orthogonal
+    // seams).
+    let (allow, brain, memory, agent) = match cfg.workload {
         Workload::Capable => (
             // The capable loop is the both-acts workload PLUS the outward voice: the brain +
             // memory sentinels AND the nostr.publish actuator token in the allowlist, so
@@ -474,7 +452,7 @@ fn agent_boot_config(
             ],
             Some(cfg.brain.clone()),
             Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
-            Some(cfg.diarist),
+            Some(cfg.agent),
         ),
         _ => (vec!["mint.test.local".to_string()], None, None, None),
     };
@@ -517,7 +495,7 @@ fn agent_boot_config(
         workload: Some(cfg.workload.genome_workload().to_string()),
         brain,
         memory,
-        diarist,
+        agent,
         social,
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
         // the C-5 lane). The membrane still holds structurally (no guest network).
@@ -887,7 +865,7 @@ mod tests {
             workload: Workload::AppCheckpoint,
             brain: Default::default(),
             memory: Default::default(),
-            diarist: Default::default(),
+            agent: Default::default(),
             meter: Default::default(),
             mode,
             funding: FundingConfig {
