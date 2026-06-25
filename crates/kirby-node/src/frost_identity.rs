@@ -36,6 +36,12 @@ use kirby_custody::cosign_net::npub_encode;
 use kirby_custody::group_xonly_q;
 use serde::{Deserialize, Serialize};
 
+/// Max size of a FROST identity keystore file. A 2-of-3 `PublicKeyPackage`
+/// hex-JSON is well under a KiB; this generous cap bounds the read so a hostile or
+/// mistaken keystore path (a huge file, or a symlink to a device/procfs/FIFO node)
+/// cannot make the loader allocate unboundedly or block. (S3a review MED hardening.)
+const MAX_KEYSTORE_BYTES: u64 = 256 * 1024;
+
 /// On-disk form of the FROST identity keystore: the group `PublicKeyPackage` only
 /// (the PUBLIC verifying material -- NO secret shares). Hex of the ZF
 /// `PublicKeyPackage::serialize()`, the same encoding `kirby_custody::persist`
@@ -57,6 +63,10 @@ pub struct FrostIdentity {
     /// The derived taproot output key Q as 32 x-only bytes (cached so npub/q_xonly
     /// are infallible accessors after load).
     q_bytes: [u8; 32],
+    /// The npub (NIP-19 bech32 of Q), computed once at construction so the `npub()`
+    /// accessor is infallible and we fail loud at load time if encoding ever fails
+    /// (rather than silently degrading to an empty string). (S3a review LOW.)
+    npub: String,
     /// The keystore file this identity was loaded from.
     keystore_path: PathBuf,
 }
@@ -74,6 +84,27 @@ impl FrostIdentity {
     /// air (it needs a 2-of-3 dealer/DKG ceremony). Provisioning the keystore is
     /// the custody crate's job; this loads an already-provisioned group identity.
     pub fn load(keystore_path: &Path) -> anyhow::Result<Self> {
+        // Bound + sanity-check the target BEFORE slurping it: a keystore path that
+        // points at a non-regular file (FIFO/device/procfs node) could block
+        // indefinitely, and an oversized file could exhaust memory. A real keystore
+        // is a small regular file. (S3a review MED hardening.)
+        let meta = std::fs::metadata(keystore_path).with_context(|| {
+            format!("stat FROST identity keystore {}", keystore_path.display())
+        })?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "FROST identity keystore {} is not a regular file",
+                keystore_path.display()
+            );
+        }
+        if meta.len() > MAX_KEYSTORE_BYTES {
+            anyhow::bail!(
+                "FROST identity keystore {} is too large ({} bytes > {} cap)",
+                keystore_path.display(),
+                meta.len(),
+                MAX_KEYSTORE_BYTES
+            );
+        }
         let bytes = std::fs::read(keystore_path).with_context(|| {
             format!("read FROST identity keystore {}", keystore_path.display())
         })?;
@@ -85,18 +116,13 @@ impl FrostIdentity {
             .context("hex-decode the FROST PublicKeyPackage")?;
         let pubkeys = PublicKeyPackage::deserialize(&pubkeys_bytes)
             .map_err(|e| anyhow::anyhow!("deserialize FROST PublicKeyPackage: {e}"))?;
-        let q_bytes = group_xonly_q(&pubkeys)
-            .map_err(|e| anyhow::anyhow!("derive FROST group taproot key Q: {e}"))?;
+        let id = Self::from_pubkeys(pubkeys, keystore_path)?;
         tracing::info!(
-            npub = %npub_encode(&q_bytes).unwrap_or_default(),
+            npub = %id.npub,
             path = %keystore_path.display(),
             "loaded per-agent FROST identity (derive-only, no signing)"
         );
-        Ok(FrostIdentity {
-            pubkeys,
-            q_bytes,
-            keystore_path: keystore_path.to_path_buf(),
-        })
+        Ok(id)
     }
 
     /// Construct directly from an in-memory group `PublicKeyPackage` (e.g. right
@@ -109,9 +135,14 @@ impl FrostIdentity {
     ) -> anyhow::Result<Self> {
         let q_bytes = group_xonly_q(&pubkeys)
             .map_err(|e| anyhow::anyhow!("derive FROST group taproot key Q: {e}"))?;
+        // Encode the npub once and fail loud here if it ever fails, rather than
+        // silently degrading to "" at the accessor. (S3a review LOW.)
+        let npub = npub_encode(&q_bytes)
+            .map_err(|e| anyhow::anyhow!("encode FROST identity npub from Q: {e}"))?;
         Ok(FrostIdentity {
             pubkeys,
             q_bytes,
+            npub,
             keystore_path: keystore_path.to_path_buf(),
         })
     }
@@ -137,7 +168,7 @@ impl FrostIdentity {
     /// This identity's npub (NIP-19 bech32 of Q), the stable per-agent FROST
     /// identity. Derived via `kirby_custody::cosign_net::npub_encode`.
     pub fn npub(&self) -> String {
-        npub_encode(&self.q_bytes).unwrap_or_default()
+        self.npub.clone()
     }
 
     /// The group public key package this identity wraps (the FROST verifying
