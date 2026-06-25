@@ -436,6 +436,14 @@ impl ProcessTenantLauncher {
         // tenant takes its OWN sled lock (DB-per-agent isolation, spec 2.1).
         cfg.node_id = spec.allocation.instance_id.clone();
         cfg.funding.initial_sats = spec.initial_sats;
+        // Give each tenant its OWN Nostr identity key dir (keyed off the unique instance id),
+        // mirroring the DB-per-agent treasury isolation above. Without this every tenant child
+        // inherits the base config's `identity.key_path` verbatim and resolves to the SAME
+        // `node.nostr.key`; since key creation is exclusive (`create_new`, nerve.rs), all but
+        // the first tenant fail with EEXIST and exit. A per-instance dir resolves to its own
+        // `<dir>/node.nostr.key`, so each tenant gets a distinct npub (and, via the §F3 one-key
+        // invariant, its own memory key too).
+        cfg.identity.key_path = self.config_dir.join(format!("keys-{}", spec.allocation.instance_id));
         // A tenant child is a plain single-agent `kirby agent`; it must NOT inherit the fleet
         // tenant list (no recursive fleets).
         cfg.fleet = crate::config::FleetConfig::default();
@@ -849,6 +857,26 @@ mod tests {
             crate::boot::treasury_path_for(&cfg_a.node_id),
             crate::boot::treasury_path_for(&cfg_b.node_id),
             "two tenants must get distinct treasury paths"
+        );
+
+        // Two tenants must also derive DISTINCT identity key paths. Without this they inherit
+        // the base config's `identity.key_path` verbatim and race to create the SAME
+        // `node.nostr.key` (exclusive `create_new` in nerve.rs) -- every tenant but the first
+        // exits with EEXIST. This regresses the multi-tenant fleet to a single live tenant.
+        assert_ne!(
+            cfg_a.identity.key_path, cfg_b.identity.key_path,
+            "two tenants must derive distinct identity key paths (else they collide on one npub)"
+        );
+        assert_ne!(
+            crate::nerve::NodeIdentity::resolve_key_path(
+                Some(&cfg_a.identity.key_path),
+                &cfg_a.identity.treasury_dir(),
+            ),
+            crate::nerve::NodeIdentity::resolve_key_path(
+                Some(&cfg_b.identity.key_path),
+                &cfg_b.identity.treasury_dir(),
+            ),
+            "two tenants must resolve to distinct node.nostr.key files"
         );
     }
 }
