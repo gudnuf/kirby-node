@@ -13,7 +13,7 @@ Nostr fleet.
 - **Sovereign by default.** `kirby run` provisions the agent its own 2-of-3 **FROST**
   threshold key **Q** on first boot and signs its entire public voice through a live
   in-process quorum; on restart it reloads the *same* Q (idempotent, fail-closed). **Today
-  the three shares are co-located on this host** — the threshold *structure* is real, but
+  the three shares are co-located on this host** -- the threshold *structure* is real, but
   cross-machine holder distribution is the roadmap, so don't claim "a key no human holds"
   yet. `--no-frost` is a dev/test fast-path (plain node key), not the default.
 - **ecash metabolism, no on-chain.** The brokered-act mint is a local CDK fakewallet; the
@@ -29,7 +29,7 @@ From a config file to a live agent, composing pieces that already exist:
 
 1. Load and validate the config; resolve the backend by platform (unless pinned).
 2. Provision (first boot) or idempotently reload (restart) the agent's own 2-of-3 FROST
-   keystore and derive its sovereign **Q + npub** — the same Q across restarts. (`--no-frost`
+   keystore and derive its sovereign **Q + npub** -- the same Q across restarts. (`--no-frost`
    falls back to a plain node key.)
 3. Join the fleet: presence + heartbeat + a `9100` lifecycle event.
 4. `mode = "bootstrap"`: fund the treasury to "born". `mode = "resume"`: restore the agent from
@@ -116,7 +116,7 @@ local relay for testing with `nix run .#relay` (defaults to `127.0.0.1:7777`).
 
 The surviving subcommands are `prereqs`, `agent` (the run path), `boot`, `app-checkpoint`,
 and `fleet` (the multi-tenant supervisor); run `--help` for each. The standalone per-gate
-demo subcommands have been removed — the invariants they proved now live in the integration
+demo subcommands have been removed -- the invariants they proved now live in the integration
 test suite (`cargo test --workspace`).
 
 ## macOS specifics
@@ -153,7 +153,7 @@ walkthrough on an M-series Mac.
 - The lease fences a term so two hosts never run + debit the same agent at once (no
   split-brain).
 
-Live cross-node failover (a node dies, a peer respawns the agent elsewhere) is **roadmap** —
+Live cross-node failover (a node dies, a peer respawns the agent elsewhere) is **roadmap** --
 the lease/fence is wired, the autonomous respawn-elsewhere is not.
 
 ## The honest boundary (what is NOT wired yet)
@@ -161,11 +161,11 @@ the lease/fence is wired, the autonomous respawn-elsewhere is not.
 Be honest about this when reporting:
 
 - **Threshold custody is structural, not yet distributed.** Q is a real 2-of-3 FROST key and
-  signs everything, but the three shares are **co-located on the host** today — an operator
+  signs everything, but the three shares are **co-located on the host** today -- an operator
   could still collude. Cross-machine holder distribution (the TEE-substitute) is the roadmap;
   until then, do not claim "a key no human holds."
 - **ecash only.** The mint is a local CDK fakewallet; there is no on-chain Bitcoin spend.
-- **No live cross-node failover** — the lease/fence is wired, autonomous respawn-elsewhere is not.
+- **No live cross-node failover** -- the lease/fence is wired, autonomous respawn-elsewhere is not.
 - **No production hardening.**
 - A known caveat: the genome's vsock request timeout is short (safe for a local fakewallet
   settle); a real non-local Lightning melt could exceed it. Revisit before any non-local mint.
