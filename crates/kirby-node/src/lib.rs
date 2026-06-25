@@ -226,6 +226,7 @@ pub mod nosplitbrain_run;
 pub mod prereqs;
 pub mod raft_lease;
 pub mod rail;
+pub mod relay_lease;
 pub mod run_agent;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
