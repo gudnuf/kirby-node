@@ -1,13 +1,12 @@
 //! The relay-native, FROST-signed cross-machine lease (#9, build-spec
-//! `build-spec-kirby-failover-relay-lease-20260625.md` chunk a): an ADDITIVE second
-//! implementation of the [`crate::raft_lease::LeaseAuthority`] seam that needs NO new
-//! transport -- it rides the SAME Nostr relay the nerve already uses for presence /
-//! lifecycle / FROST cosign, so it works across LAN/NAT where the loopback-only openraft
-//! lease cannot form.
+//! `build-spec-kirby-failover-relay-lease-20260625.md`): the ACTIVE implementation of the
+//! [`crate::lease::LeaseAuthority`] seam. It needs NO new transport -- it rides the SAME
+//! Nostr relay the nerve already uses for presence / lifecycle / FROST cosign, so it works
+//! across LAN/NAT where the loopback-only Raft lease (now CUT) could not form.
 //!
 //! WHY (the corrected fact that simplifies failover): the relay ALREADY does NAT
 //! traversal for everything, including the cross-machine FROST cosign proof (turtle +
-//! LNVPS co-signed a real kind:1 over the relay). Plain-TCP openraft needs inbound peer
+//! LNVPS co-signed a real kind:1 over the relay). Plain-TCP loopback-Raft needs inbound peer
 //! dials and cannot form across NAT; the relay does not. So cross-machine coordination
 //! reuses the relay rather than inventing a transport.
 //!
@@ -15,7 +14,7 @@
 //! ADDRESSABLE on `["d", <agent_id>]`, content JSON
 //! `{ agent_id, holder_node_id, term, issued_at }`. Latest-wins by the MONOTONIC `term`
 //! in the content (NOT by `created_at`): an observer never moves a term backward
-//! (observe-only-forward), exactly mirroring the openraft handle's
+//! (observe-only-forward), exactly mirroring the loopback-Raft handle's
 //! `observe_committed_lease_for` semantics. A node ACTS for an agent only while it holds
 //! the latest observed term; failover claims `term + 1` (a monotonic fencing token).
 //!
@@ -34,11 +33,11 @@
 //! than acting on a stale term (liveness-over-safety): it cannot confirm it is still the
 //! latest holder, so it stands down.
 //!
-//! SCOPE (additive only): this module + the new proto kind + its tests. It is NOT wired as
-//! the active authority in boot/gateway, and the openraft [`crate::raft_lease::LeaseHandle`]
-//! is untouched -- both impls coexist behind the trait. The flip (retarget the
-//! no-split-brain test, cut openraft) is the NEXT chunk. The per-spend term-gate (F9-4) and
-//! the cryptographic membrane co-sign (sovereign form) are later chunks too.
+//! SCOPE: this is the ACTIVE lease authority. The fleet supervisor CLAIMS an agent's lease
+//! here on launch ([`RelayLeaseAuthority::claim`] -> publish to the relay), and the gateway
+//! money-fence reads it through the [`crate::lease::LeaseAuthority`] trait. The loopback Raft
+//! lease has been removed. The per-spend term-gate (F9-4) and the cryptographic
+//! membrane co-sign (sovereign form) are later chunks.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,8 +47,8 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::lease::{ActiveLease, FenceVerdict, LeaseAuthority, LeaseNodeId, LeaseResponse};
 use crate::quorum_signer::QuorumSigner;
-use crate::raft_lease::{ActiveLease, FenceVerdict, LeaseAuthority, LeaseNodeId};
 use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 
 /// The lease time-to-live (spec 10): a lease whose `issued_at` is older than this is
@@ -139,7 +138,7 @@ pub struct RelayLeaseAuthority {
     expected_q: HashMap<String, [u8; 32]>,
     /// The latest observed lease per agent (observe-only-forward by term). Behind a
     /// `RwLock` so the observe task (write) and the fence reads (read) cross tasks, like
-    /// the openraft store's `RwLock`.
+    /// the loopback-Raft store's `RwLock`.
     observed: RwLock<HashMap<String, ObservedLease>>,
 }
 
@@ -258,7 +257,7 @@ impl RelayLeaseAuthority {
         if verify_lease_event(event, expected_q).is_err() {
             return false;
         }
-        // 4. LATEST-WINS, OBSERVE-ONLY-FORWARD by monotonic term (mirrors the openraft
+        // 4. LATEST-WINS, OBSERVE-ONLY-FORWARD by monotonic term (mirrors the loopback-Raft
         //    store's observe_committed_lease_for: only a STRICTLY-newer term replaces the
         //    observed lease; a stale or equal term is ignored, so the term never moves
         //    backward).
@@ -296,7 +295,7 @@ impl LeaseAuthority for RelayLeaseAuthority {
 
     /// The committed active lease for `agent_id`, or `None` if none is observed (or the
     /// latest observed one has gone stale). Reads ONLY this agent's entry, so it never
-    /// reports another agent's holder -- per-agent isolation, like the openraft handle.
+    /// reports another agent's holder -- per-agent isolation, like the loopback-Raft handle.
     async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease> {
         self.fresh_active_lease(agent_id, now_secs()).await
     }
@@ -304,7 +303,7 @@ impl LeaseAuthority for RelayLeaseAuthority {
     /// The term THIS node is active at for `agent_id`: `Some(term)` only if the latest
     /// FRESH observed lease still names this node, else `None`. The relay-lease has no
     /// separate "leadership": holding the latest non-stale term IS being active (the
-    /// relay-settled latest-wins is the linearization the openraft leader provided).
+    /// relay-settled latest-wins is the linearization the loopback-Raft leader provided).
     async fn active_term_for(&self, agent_id: &str) -> Option<u64> {
         match self.fresh_active_lease(agent_id, now_secs()).await {
             Some(l) if l.node_id == self.node_id => Some(l.term),
@@ -316,9 +315,9 @@ impl LeaseAuthority for RelayLeaseAuthority {
 
     /// THE TERM-FENCE for `agent_id` for a node that BELIEVES it is active at
     /// `believed_term`: `Active` only if the latest FRESH observed lease still names THIS
-    /// node at a term >= `believed_term`; otherwise `Fenced`. Identical fencing semantics
-    /// to the openraft [`crate::raft_lease::LeaseHandle::fence_for`] (a higher-term claim
-    /// by another node, OR a lease moved to another holder, fences this node out), with the
+    /// node at a term >= `believed_term`; otherwise `Fenced`. The fencing semantics the cut
+    /// loopback-Raft lease used (a higher-term claim by another node, OR a lease moved to another
+    /// holder, fences this node out), with the
     /// added F9-3 rule: a STALE lease (TTL elapsed, e.g. the relay stopped delivering)
     /// fences too -- a node stands down rather than acting on a term it can no longer
     /// confirm is latest. Reads ONLY this agent's entry (per-agent isolation).
@@ -431,4 +430,128 @@ fn verify_lease_event(event: &NostrEvent, expected_q: &[u8; 32]) -> anyhow::Resu
     secp.verify_schnorr(&sig, &Message::from_digest(derived_id), &q_xonly)
         .context("lease event BIP-340 signature does not verify under the agent's Q")?;
     Ok(())
+}
+
+/// PUBLISH a signed lease event to the relay (the write-side transport). A node that CLAIMS a
+/// lease FROST-signs it ([`RelayLeaseAuthority::claim`]) then publishes it here so observing
+/// nodes pick it up. A trait so the production path (a nerve relay [`nostr_sdk::Client`]) and
+/// the tests (an in-memory relay) share the [`RelayLeaseGrantor`] without it depending on the
+/// concrete wire.
+#[async_trait::async_trait]
+pub trait LeasePublisher: Send + Sync {
+    /// Publish the (already FROST-signed) lease event to the relay. Errors if the publish
+    /// fails (the claim then surfaces an error and the launch does not proceed as active).
+    async fn publish_lease(&self, event: &NostrEvent) -> anyhow::Result<()>;
+}
+
+/// The production [`LeasePublisher`]: publishes a pre-signed lease event to the fleet relay
+/// over a nostr-sdk client (the SAME wire the nerve presence/lifecycle/FROST cosign uses --
+/// no new transport). The lease is already FROST-signed under the agent's Q, so the client's
+/// own (throwaway) key is irrelevant; it is published VERBATIM as a pre-signed owned event
+/// via `send_event` (mirroring the actuator's FROST publish path), then re-materialized +
+/// locally re-verified before it leaves.
+pub struct RelayLeasePublisher {
+    client: nostr_sdk::Client,
+}
+
+impl RelayLeasePublisher {
+    /// Connect a publisher to `relay_url` (a read/write client; the lease is pre-signed, so
+    /// the client key is never used to sign). Reuses the nerve's reader-client construction.
+    pub async fn connect(relay_url: &str) -> anyhow::Result<Self> {
+        let client = crate::nerve::connect_reader(relay_url)
+            .await
+            .with_context(|| format!("connect the relay-lease publisher to {relay_url}"))?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait::async_trait]
+impl LeasePublisher for RelayLeasePublisher {
+    async fn publish_lease(&self, event: &NostrEvent) -> anyhow::Result<()> {
+        // Re-materialize the pre-signed lease from its NIP-01 JSON and locally re-verify (id +
+        // BIP-340 sig under Q) before it leaves -- fail closed if the aggregate is bad, exactly
+        // as the nerve's FROST beacon publish does.
+        use nostr_sdk::JsonUtil as _;
+        let json = serde_json::to_string(event).context("serialize the lease event to JSON")?;
+        let owned = nostr_sdk::Event::from_json(&json)
+            .map_err(|e| anyhow::anyhow!("parse the FROST-signed lease event: {e}"))?;
+        owned
+            .verify()
+            .map_err(|e| anyhow::anyhow!("lease event failed local verification before publish: {e}"))?;
+        self.client
+            .send_event(&owned)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish the lease event to the relay: {e}"))?;
+        Ok(())
+    }
+}
+
+/// The relay-native CLAIM (write-side) grantor wired into the fleet supervisor's launch path
+/// ([`crate::fleet_supervisor::LeaseGrantor`]): it holds this node's id and a
+/// [`LeasePublisher`]. On a claim it LOADS the tenant's per-agent quorum Q from the keystore
+/// the supervisor just provisioned, FROST-signs a lease at the requested term, publishes it to
+/// the relay, and returns the claimed `{node_id, term}`. Loading the quorum per claim (rather
+/// than holding one signer) is what lets ONE grantor claim for EVERY tenant -- each tenant's
+/// lease is signed under ITS OWN Q (F9-2: a node can only claim a lease for an agent whose
+/// quorum it holds). The MVP claims term 1 on launch; a failover takeover (a later chunk)
+/// claims `term + 1`.
+pub struct RelayLeaseGrantor {
+    node_id: LeaseNodeId,
+    publisher: Arc<dyn LeasePublisher>,
+}
+
+impl RelayLeaseGrantor {
+    /// Build a grantor for this node over a relay publisher.
+    pub fn new(node_id: LeaseNodeId, publisher: Arc<dyn LeasePublisher>) -> Self {
+        Self { node_id, publisher }
+    }
+
+    /// CLAIM `agent_id`'s lease for this node at `term` using the per-agent quorum loaded from
+    /// `keystore_dir`: FROST-sign the lease under that Q, publish it to the relay, and return
+    /// the claimed `{node_id, term}`. The `node_id` argument MUST be this grantor's own node id
+    /// (a node can only claim a lease naming itself as holder); a mismatch is an error.
+    pub async fn claim_for(
+        &self,
+        agent_id: &str,
+        node_id: LeaseNodeId,
+        term: u64,
+        keystore_dir: &std::path::Path,
+    ) -> anyhow::Result<LeaseResponse> {
+        anyhow::ensure!(
+            node_id == self.node_id,
+            "a node can only claim a lease naming ITSELF as holder: requested holder {node_id} != this node {}",
+            self.node_id
+        );
+        // Load the tenant's OWN quorum Q from the keystore the supervisor provisioned, and
+        // build a single-agent authority that signs THIS agent's lease under THAT Q.
+        let signer = Arc::new(
+            crate::keyset_provisioning::load_quorum_signer_at(keystore_dir).with_context(|| {
+                format!(
+                    "load the per-agent quorum for {agent_id} from {} to sign its lease",
+                    keystore_dir.display()
+                )
+            })?,
+        );
+        let authority = RelayLeaseAuthority::single_agent(self.node_id, agent_id, signer);
+        let event = authority.claim(agent_id, term).await?;
+        self.publisher
+            .publish_lease(&event)
+            .await
+            .context("publish the claimed lease to the relay")?;
+        Ok(LeaseResponse { node_id, term })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::fleet_supervisor::LeaseGrantor for RelayLeaseGrantor {
+    /// Claim `agent_id`'s lease at term 1 (MVP first-launch claim). A failover takeover that
+    /// claims `term + 1` is a later chunk; on first launch the term is 1.
+    async fn grant_for(
+        &self,
+        agent_id: &str,
+        node_id: LeaseNodeId,
+        keystore_dir: &std::path::Path,
+    ) -> anyhow::Result<LeaseResponse> {
+        self.claim_for(agent_id, node_id, 1, keystore_dir).await
+    }
 }
