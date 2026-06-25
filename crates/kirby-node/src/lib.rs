@@ -189,6 +189,13 @@ pub mod fleet;
 // signing path; fleet-tenant-only, behind the custody graft. Platform-agnostic
 // host-side type (like `nerve`), so NOT cfg-gated.
 pub mod frost_identity;
+// S3c per-agent FROST live quorum signer. The signing counterpart of
+// `frost_identity::FrostIdentity`: holds the per-guardian KeyPackages (in-process
+// for S3, behind a Holder seam for S5/S6 remote swap) and produces aggregate
+// BIP-340 signatures under Q, with the guardian-validation membrane wired into
+// every holder. Platform-agnostic host-side type (like `frost_identity`), so NOT
+// cfg-gated.
+pub mod quorum_signer;
 pub mod fleet_supervisor;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;

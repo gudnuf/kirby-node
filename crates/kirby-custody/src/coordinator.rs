@@ -80,6 +80,20 @@ pub fn key_packages(
         .collect()
 }
 
+/// Round-1 commit for a single signer using the custody crate's OS CSPRNG (`rand`
+/// 0.8, the rand_core 0.6 the ZF frost crate requires). Produces a FRESH single-use
+/// signing nonce + its public commitment.
+///
+/// This is exposed so callers OUTSIDE this crate (e.g. kirby-node's S3c
+/// `QuorumSigner`, whose own `rand` resolves to an incompatible rand_core 0.9) can
+/// drive the round-1 commit without taking a second `rand` version. The secret
+/// `SigningNonces` is single-use and zeroized on drop after round 2; the caller must
+/// not persist or reuse it. Mirrors the coordinator's own `round1::commit` call.
+pub fn commit_for(kp: &KeyPackage) -> (SigningNonces, SigningCommitments) {
+    let mut rng = rand::rngs::OsRng;
+    frost::round1::commit(kp.signing_share(), &mut rng)
+}
+
 /// The in-process FROST coordinator. One instance drives one signing ceremony
 /// (fresh nonces); create a new one per ceremony. This is the shape the D-10
 /// async Signer seam wraps at convergence: Signer::sign(message) maps to

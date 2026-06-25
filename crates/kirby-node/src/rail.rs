@@ -37,7 +37,7 @@ use prost::Message as _;
 // The real EngramStore (Chunk-2) is a host-side nostr-sdk client over the nerve relay
 // set. `Event` here is the nostr event, NOT `kirby_proto::Event` (which rail.rs never
 // names) -- no conflict. `EventBuilder` builds the actuator's kind:1 note (the agent's voice).
-use nostr_sdk::{Client, Event, EventBuilder, Filter, Keys, Kind, Timestamp, ToBech32};
+use nostr_sdk::{Client, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, Timestamp, ToBech32};
 
 use crate::engram::{EngramCrypto, EngramFrame, KIND_ENGRAM};
 
@@ -750,13 +750,28 @@ pub trait Actuator: Send + Sync {
     async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome;
 }
 
-/// The real outward actuator (`nostr.publish`): holds the node identity keys + a connected
-/// nostr-sdk client to the relay set + a small fixed publish cost. Cheap to clone (an `Arc` over
-/// the client). Built at boot from the SAME node identity + relay the presence beacon uses, so a
-/// published note is followable as that agent's public feed.
+/// How the actuator signs the note it publishes (the S3c fork):
+///   * `SingleKey` -- the existing path (non-fleet `kirby run` / `kirby agent`): a local
+///     secp256k1/BIP340 `Keys` signs via `EventBuilder`. UNCHANGED and byte-identical (G-CLEAN).
+///   * `Frost` -- the S3c per-agent FROST tenant: the agent's identity IS the threshold group
+///     taproot key Q; there is NO node-local signing key. A 2-of-3 quorum signs the note (with the
+///     guardian membrane on every holder) and the daemon publishes the PRE-SIGNED event.
+#[derive(Clone)]
+enum SigningMode {
+    /// The single-key path: a local `Keys` is the nostr-sdk client's signer.
+    SingleKey(Keys),
+    /// The FROST path: a quorum signer produces the aggregate-signed event under Q. The client has
+    /// NO signer set (we never call `send_event_builder`; we send a pre-built owned `Event`).
+    Frost(Arc<crate::quorum_signer::QuorumSigner>),
+}
+
+/// The real outward actuator (`nostr.publish`): holds the signing mode (single-key OR a FROST
+/// quorum) + a connected nostr-sdk client to the relay set + a small fixed publish cost. Cheap to
+/// clone (an `Arc` over the client). Built at boot from the SAME identity + relay the presence
+/// beacon uses, so a published note is followable as that agent's public feed.
 #[derive(Clone)]
 pub struct NostrActuator {
-    keys: Keys,
+    mode: SigningMode,
     client: Arc<Client>,
     /// The fixed host cost (sats) of one publish: small + non-zero (clamped to >= 1) so a post is
     /// never free, like a memory write. Configurable per deployment.
@@ -764,9 +779,10 @@ pub struct NostrActuator {
 }
 
 impl NostrActuator {
-    /// Connect an actuator: build a nostr-sdk client signed by `keys`, add the relays, and connect
-    /// (mirrors [`EngramStore::connect`]). Errors if no relay is configured (a misconfigured
-    /// actuator is a boot bug, not a runtime outcome).
+    /// Connect a SINGLE-KEY actuator: build a nostr-sdk client signed by `keys`, add the relays,
+    /// and connect (mirrors [`EngramStore::connect`]). Errors if no relay is configured (a
+    /// misconfigured actuator is a boot bug, not a runtime outcome). This is the existing,
+    /// byte-identical non-fleet path.
     pub async fn connect(keys: Keys, relays: &[String], cost_sats: u64) -> anyhow::Result<Self> {
         use anyhow::Context as _;
         if relays.is_empty() {
@@ -784,29 +800,108 @@ impl NostrActuator {
             npub = %keys.public_key().to_bech32().unwrap_or_default(),
             relays = relays.len(),
             cost_sats = cost_sats.max(1),
-            "NostrActuator connected (the agent's outward voice)"
+            "NostrActuator connected (single-key, the agent's outward voice)"
         );
-        Ok(NostrActuator { keys, client: Arc::new(client), cost_sats: cost_sats.max(1) })
+        Ok(NostrActuator { mode: SigningMode::SingleKey(keys), client: Arc::new(client), cost_sats: cost_sats.max(1) })
     }
 
-    /// Compose, SIGN (with the node key), and publish a kind:1 note carrying `content` to the
-    /// relay set; return the event id hex (the receipt proof). `content` is ALREADY validated by
-    /// [`validate_nostr_publish`]. Reuses the nerve's `send_event_builder` publish path.
+    /// Connect a FROST actuator (S3c, fleet-tenant): the agent has NO node-local signing key; its
+    /// identity IS the group taproot key Q held by the `quorum`. The client carries NO signer
+    /// (we publish a pre-signed, owned `Event` built by the quorum). Add the relays + connect.
+    pub async fn connect_frost(
+        quorum: Arc<crate::quorum_signer::QuorumSigner>,
+        relays: &[String],
+        cost_sats: u64,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        if relays.is_empty() {
+            anyhow::bail!("NostrActuator requires at least one relay (the agent's publish relay)");
+        }
+        // No `.signer(..)`: a FROST event is signed by the quorum, never by a local key. Sending a
+        // pre-built owned `Event` via `send_event` does not need a client signer.
+        let client = Client::builder().build();
+        for url in relays {
+            client
+                .add_relay(url)
+                .await
+                .with_context(|| format!("add actuator relay {url}"))?;
+        }
+        client.connect().await;
+        let q_npub = kirby_custody::cosign_net::npub_encode(&quorum.q_bytes()).unwrap_or_default();
+        tracing::info!(
+            npub = %q_npub,
+            relays = relays.len(),
+            cost_sats = cost_sats.max(1),
+            "NostrActuator connected (FROST 2-of-3 quorum; the agent's voice is its threshold key Q)"
+        );
+        Ok(NostrActuator { mode: SigningMode::Frost(quorum), client: Arc::new(client), cost_sats: cost_sats.max(1) })
+    }
+
+    /// Compose, SIGN, and publish a kind:1 note carrying `content` to the relay set; return the
+    /// event id hex (the receipt proof). `content` is ALREADY validated by
+    /// [`validate_nostr_publish`]; the FROST path re-sanitizes again inside `sign_nostr_event`
+    /// (a new signing entry point re-enforces the guards, never assuming the caller did).
+    ///
+    /// Two modes:
+    ///   * SingleKey: reuse the nerve's `send_event_builder` path (UNCHANGED).
+    ///   * Frost: run the 2-of-3 quorum (membrane on every holder) to build a PRE-SIGNED event,
+    ///     verify the aggregate signature locally (fail-closed), then publish the OWNED event via
+    ///     `send_event` (NOT `send_event_builder` -- the signing key is the threshold Q, there is
+    ///     no local `Keys`).
     async fn publish_note(&self, content: &str) -> anyhow::Result<String> {
         use anyhow::Context as _;
-        let builder = EventBuilder::new(Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), content);
-        let output = self
-            .client
-            .send_event_builder(builder)
-            .await
-            .context("publish kind:1 note to the relay set")?;
-        Ok(output.val.to_hex())
+        match &self.mode {
+            SigningMode::SingleKey(_) => {
+                let builder = EventBuilder::new(Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), content);
+                let output = self
+                    .client
+                    .send_event_builder(builder)
+                    .await
+                    .context("publish kind:1 note to the relay set")?;
+                Ok(output.val.to_hex())
+            }
+            SigningMode::Frost(quorum) => {
+                // The 2-of-3 ceremony (with the guardian membrane on every holder) builds the
+                // aggregate-signed event under Q. created_at is the host clock (the genome sees no
+                // bytes of this). Any refusal aborts here (no publish, no proof).
+                let created_at = Timestamp::now().as_secs();
+                let event = quorum
+                    .sign_nostr_event(kirby_proto::NOSTR_KIND_TEXT_NOTE as u32, created_at, content)
+                    .context("FROST quorum failed to co-sign the kind:1 note")?;
+                // Re-materialize as a nostr-sdk Event from its NIP-01 JSON and VERIFY locally (id +
+                // BIP-340 sig under Q) before sending -- fail closed if the aggregate is bad, so a
+                // broken quorum never reaches the relay.
+                let json = serde_json::to_string(&event)
+                    .context("serialize FROST-signed event to JSON")?;
+                let sdk_event = Event::from_json(&json)
+                    .map_err(|e| anyhow::anyhow!("parse FROST-signed event: {e}"))?;
+                sdk_event
+                    .verify()
+                    .map_err(|e| anyhow::anyhow!("FROST-signed event failed local verification: {e}"))?;
+                let output = self
+                    .client
+                    .send_event(&sdk_event)
+                    .await
+                    .context("publish pre-signed FROST kind:1 note to the relay set")?;
+                Ok(output.val.to_hex())
+            }
+        }
     }
 
-    /// The node's public key (the npub the note is signed by). Exposed for the e2e to verify the
-    /// published note's author; the SIGNING key never leaves the daemon.
+    /// The agent's public key (the npub the note is signed by): the local key in single-key mode,
+    /// or the FROST group taproot key Q in FROST mode. Exposed for the e2e to verify the published
+    /// note's author; the SIGNING material never leaves the daemon.
     pub fn public_key(&self) -> nostr_sdk::PublicKey {
-        self.keys.public_key()
+        match &self.mode {
+            SigningMode::SingleKey(keys) => keys.public_key(),
+            SigningMode::Frost(quorum) => {
+                // Q is a 32-byte x-only key; a nostr PublicKey is x-only. This never fails for a
+                // valid group key, but fall back to the all-zero key rather than panic in an
+                // accessor (the e2e compares the published event's pubkey to this).
+                nostr_sdk::PublicKey::from_slice(&quorum.q_bytes())
+                    .unwrap_or_else(|_| nostr_sdk::PublicKey::from_slice(&[2u8; 32]).expect("placeholder"))
+            }
+        }
     }
 }
 

@@ -27,7 +27,7 @@ pub mod persist;
 pub mod reshare;
 pub mod seam;
 pub mod spend;
-pub use coordinator::{key_packages, Coordinator, SessionState, SignError};
+pub use coordinator::{commit_for, key_packages, Coordinator, SessionState, SignError};
 pub use reshare::{reshare_same_membership, RefreshedKeyset};
 pub use seam::{coordinate_2of3_over_seam, CoSignEvent, GuardianId, InMemoryRelay, RelayAdapter};
 
