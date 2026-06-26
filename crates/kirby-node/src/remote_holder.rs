@@ -636,11 +636,16 @@ mod tests {
             );
         }
 
-        // (b) NEGATIVE-BY-BYTES: independently produce a SigningNonces for this holder's
-        //     share (the same commit_for the server uses), serialize it the same way the
-        //     server serializes a commitment/share (serde_json), and assert NONE of its
-        //     bytes appear inside any wire payload. This catches a nonce smuggled inside a
-        //     larger frame, not only a frame that IS a nonce.
+        // (b) NEGATIVE-BY-BYTES (defense-in-depth on top of (a)): independently produce a
+        //     SigningNonces for this holder's share and serialize it the same way the server
+        //     serializes a commitment/share (serde_json), then assert NONE of its bytes
+        //     appear inside any wire payload. A SigningNonces is randomized, so this sample's
+        //     exact bytes differ from whatever the server generated -- so (b) does NOT prove
+        //     the server's specific nonce is absent (that is (a)'s job, structurally). What
+        //     (b) DOES catch is a regression that serializes a nonce with a recognizable
+        //     fixed envelope/prefix into a larger frame, which (a) (a whole-frame parse)
+        //     would miss. The two together: (a) = no frame IS a nonce; (b) = the nonce
+        //     wire-shape is not embedded in any frame.
         let (sample_nonce, _c) = kirby_custody::commit_for(&kps[1]);
         let nonce_bytes = serde_json::to_vec(&sample_nonce).expect("serialize sample nonce");
         // The nonce serialization is non-trivial; use its full body as the needle.
