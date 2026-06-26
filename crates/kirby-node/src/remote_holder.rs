@@ -47,6 +47,18 @@
 //! ([`ROUND_REFUSAL`]). A holder that refuses replies with a `ROUND_REFUSAL` event whose
 //! payload is a serialized [`RefuseReason`]; the proxy maps it back to a `RefuseReason` so
 //! the `QuorumSigner` ceremony aborts EXACTLY as it does for a co-located refusal.
+//!
+//! ENTRY-POINT GUARDS (the `feedback_new_entry_point_needs_input_guards` lesson -- a new
+//! signing entry point must re-port the guards its co-located sibling has): the proxy binds
+//! every reply to BOTH the expected `session_id` AND the expected holder identifier
+//! (`reply.from`), so a misrouted or spoofed reply for the same session on a shared relay is
+//! rejected rather than accepted as this holder's commitment/share. The `QuorumSigner`
+//! keeps the dup-signer guard (two holders aliased to one identifier are refused before
+//! round 1, so no single-use nonce is reused). Full mutual coordinator<->holder
+//! authentication over a real relay (so a rogue node cannot SOLICIT a share or replay one)
+//! is the remaining chunk-1 design item flagged in the spec's residual 6; the in-process
+//! mock here does not need it, but the sender-identity check is the half that lives in this
+//! proxy regardless of transport.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -166,6 +178,18 @@ impl<T: HolderTransport + Send + Sync> Holder for RemoteHolder<T> {
                 reply.session_id
             );
         }
+        // SENDER-IDENTITY CHECK (the new-entry-point guard): the reply MUST come from THIS
+        // holder, not another endpoint that happened to be on the same session id. On a
+        // shared relay transport a misrouted or spoofed reply for this session could
+        // otherwise be accepted; bind the reply to the expected holder identifier.
+        if identifier_to_u16(&reply.from) != self.id_u16 {
+            anyhow::bail!(
+                "remote holder {} round-1 reply came from {} (expected {})",
+                self.id_u16,
+                identifier_to_u16(&reply.from),
+                self.id_u16
+            );
+        }
         match reply.round {
             ROUND_COMMITMENT => {
                 let commitments: SigningCommitments = serde_json::from_slice(&reply.payload)
@@ -232,6 +256,12 @@ impl<T: HolderTransport + Send + Sync> Holder for RemoteHolder<T> {
             Err(_) => return Err(RefuseReason::BadKeyset),
         };
         if reply.session_id != session_id {
+            return Err(RefuseReason::BadKeyset);
+        }
+        // SENDER-IDENTITY CHECK (the new-entry-point guard): bind the round-2 reply to THIS
+        // holder. A reply (share OR refusal) from any other endpoint for this session is
+        // rejected -- a misrouted/spoofed share must never be aggregated as this holder's.
+        if identifier_to_u16(&reply.from) != self.id_u16 {
             return Err(RefuseReason::BadKeyset);
         }
         match reply.round {
@@ -865,6 +895,55 @@ mod tests {
             "the refusal should explain the collapsed/duplicate quorum: {msg}"
         );
         println!("DUP-REMOTE-HOLDER PASS: two same-identifier RemoteHolders are refused before round 1 (no nonce reuse)");
+    }
+
+    /// A transport that wraps a real link but REWRITES every reply's `from` to a different
+    /// identifier -- modeling a misrouted or spoofed reply on a shared relay. Used to prove
+    /// the proxy's sender-identity guard.
+    struct SpoofingFromLink {
+        inner: InProcessHolderLink,
+        spoof_from: GuardianId,
+    }
+    impl HolderTransport for SpoofingFromLink {
+        fn send(&self, event: CoSignEvent) -> anyhow::Result<()> {
+            self.inner.send(event)
+        }
+        fn recv(&self) -> anyhow::Result<CoSignEvent> {
+            let mut e = self.inner.recv()?;
+            e.from = self.spoof_from; // pretend the reply came from someone else
+            Ok(e)
+        }
+    }
+
+    /// THE SENDER-IDENTITY GUARD: a reply whose `from` is NOT this holder's identifier is
+    /// rejected (the proxy never accepts a misrouted/spoofed commitment or share for the
+    /// session). Catches the protocol-integrity hole a shared relay transport would expose.
+    #[test]
+    fn remote_holder_rejects_reply_from_a_wrong_sender() {
+        let ks = keyset();
+        let kps = three_kps(&ks);
+        // The server is identifier 2; the link rewrites replies to claim identifier 1.
+        let server = Arc::new(RemoteHolderServer::new(kps[1].clone(), ks.pubkeys.clone()));
+        let wrong_from = GuardianId::try_from(identifier_to_u16(kps[0].identifier())).unwrap();
+        assert_ne!(server.id(), identifier_to_u16(kps[0].identifier()), "the spoof id must differ");
+        let link = SpoofingFromLink {
+            inner: InProcessHolderLink::new(Arc::clone(&server)),
+            spoof_from: wrong_from,
+        };
+        let remote = RemoteHolder::new(server.id(), link);
+
+        // Round 1: the commit reply will claim the wrong sender -> the proxy must reject it.
+        let res = remote.commit(1);
+        assert!(
+            res.is_err(),
+            "a round-1 reply from the wrong sender must be rejected, got {res:?}"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("came from"),
+            "the rejection should name the sender mismatch: {msg}"
+        );
+        println!("SENDER-IDENTITY PASS: a reply from the wrong holder identifier is rejected (no misrouted/spoofed frame accepted)");
     }
 
     /// A naive subslice search for the nonce-bytes needle (no extra deps).
