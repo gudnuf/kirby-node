@@ -191,6 +191,15 @@ pub mod frost_identity;
 // every holder. Platform-agnostic host-side type (like `frost_identity`), so NOT
 // cfg-gated.
 pub mod quorum_signer;
+// S5/S6 (chunk 1): the RemoteHolder -- a `quorum_signer::Holder` whose FROST share lives
+// on ANOTHER machine. It exchanges OPAQUE CoSignEvents with a holder-side server; the
+// secret SigningNonces NEVER crosses the wire (each holder owns its nonce locally) and the
+// guardian membrane runs holder-side. The QuorumSigner ceremony body is unchanged when
+// holders go remote (the whole point of the Holder seam). Platform-agnostic host-side
+// type (like `quorum_signer`), so NOT cfg-gated. Chunk-1 scope: identity/signing only,
+// with an in-process mock transport for fast ungated teeth; the real relay transport is a
+// later chunk boundary.
+pub mod remote_holder;
 // S3d per-agent FROST keyset provisioning at spawn. Connects `frost_identity` (the
 // PUBLIC Q) + `quorum_signer` (the SECRET 2-of-3 signer) into the spawn path: a fleet
 // tenant is born with its OWN durable FROST group key Q (trusted-dealer keygen by the

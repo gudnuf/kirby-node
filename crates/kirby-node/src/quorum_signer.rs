@@ -65,13 +65,20 @@ use kirby_custody::guardian::{
 use kirby_custody::group_xonly_q;
 
 /// The S3 quorum size (a 2-of-3 group: any 2 of the 3 holders co-sign).
-const MIN_SIGNERS: u16 = 2;
+///
+/// `pub(crate)` so the S5/S6 [`crate::remote_holder`] module reuses the SAME threshold the
+/// co-located path uses (a remote holder's membrane `min_signers` must match the
+/// coordinator's, or it would apply a different threshold than the rest of the quorum).
+pub(crate) const MIN_SIGNERS: u16 = 2;
 
 /// Map a FROST `Identifier` to its u16 wire form (the same projection the guardian
 /// membrane uses; sound for trusted-dealer identifiers 1..=n). A holder's `id()`
 /// returns this u16 so the call site can build the membrane's `signer_set` and
 /// `my_identifier` without depending on the frost `Identifier` type.
-fn identifier_to_u16(id: &Identifier) -> u16 {
+///
+/// `pub(crate)` so the S5/S6 [`crate::remote_holder`] module derives a holder server's u16
+/// id from its `KeyPackage` with the SAME projection (the id must agree across the seam).
+pub(crate) fn identifier_to_u16(id: &Identifier) -> u16 {
     let bytes = id.serialize();
     let n = bytes.len();
     u16::from_be_bytes([bytes[n - 2], bytes[n - 1]])
