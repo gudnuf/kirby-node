@@ -41,6 +41,7 @@ use std::collections::BTreeSet;
 use frost_secp256k1_tr as frost;
 use frost::keys::PublicKeyPackage;
 use frost::{Identifier, SigningPackage};
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use crate::cosign_net::nip01_event_id;
@@ -101,7 +102,13 @@ pub const MAX_NOTE_BYTES: usize = 512;
 
 /// A typed co-sign request a guardian receives. The guardian validates THIS against the
 /// coordinator's `SigningPackage`; it never trusts the package's message bytes directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// SERDE (S5/S6): this is `Serialize`/`Deserialize` so a coordinator can send the TYPED
+/// intent to a `RemoteHolder` over the seam (the holder runs the membrane on its OWN box
+/// and re-reconstructs the id from THIS, never trusting a Q the coordinator asserts). The
+/// request carries NO secret material -- only the public intent + the claimed signer set --
+/// so serializing it leaks nothing a relay observer could not already infer from the event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoSignRequest {
     /// The signing-session id (routing/dedupe; not security-load-bearing here).
     pub session_id: u64,
@@ -112,7 +119,7 @@ pub struct CoSignRequest {
 }
 
 /// The typed intent a guardian can independently reconstruct into a signed message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignIntent {
     /// A Nostr event. S3e accepts the agent's voice (kind:1) AND its three public
     /// beacons (10100 presence / 9100 lifecycle / 31000 agent-state); the guardian
@@ -140,7 +147,11 @@ pub enum SignIntent {
 
 /// Why a guardian refused to sign. Every refusal is a HARD STOP: the guardian must not
 /// emit a signature share.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// SERDE (S5/S6): `Serialize`/`Deserialize` so a `RemoteHolder` can carry a holder's
+/// refusal back to the coordinator over the seam (an opaque refusal frame) -- the
+/// coordinator then aborts the ceremony exactly as it does for a co-located refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefuseReason {
     /// `package.message()` does not equal the id the guardian independently reconstructed
     /// from the typed intent under its OWN Q. The single most important refusal: it stops
