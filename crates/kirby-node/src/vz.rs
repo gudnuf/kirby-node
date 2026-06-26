@@ -12,6 +12,14 @@
 //! where the Rust daemon serves the unchanged `NodeGateway` tonic service.
 //! Snapshot/restore is intentionally unsupported here; macOS resume uses the
 //! app-level checkpoint path described in `docs/vz-app-checkpoint-resume.md`.
+//!
+//! Egress lockdown (gate G4) is satisfied STRUCTURALLY: the guest is vsock-only
+//! (the Swift helper configures no `VZVirtioNetworkDevice`), so there is no egress
+//! path off-box at all. A guest booted with `lockdown_egress` exposes an honest
+//! no-NIC [`VzVsockEgress`] membrane (iface `"none"`, zero drop counter). This is a
+//! stronger membrane than the Firecracker TAP + nftables default-deny, but it is
+//! VACUOUS-TRUE: it cannot demonstrate a drop the way the eBPF byte counter can,
+//! because there is no NIC to drop on.
 
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -22,8 +30,9 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::oneshot;
 
 use crate::sandbox::{
-    BackendCapabilities, BackendKind, GatewayTransport, GuestArch, GuestSpec, IsolationTier,
-    MeterFidelity, MeterSource, RestoreSpec, SandboxBackend, SandboxInstance, SnapshotArtifact,
+    BackendCapabilities, BackendKind, EgressControl, EgressDropCounter, GatewayTransport, GuestArch,
+    GuestSpec, IsolationTier, MeterFidelity, MeterSource, RestoreSpec, SandboxBackend,
+    SandboxInstance, SnapshotArtifact,
 };
 
 const VZ_HELPER: &str = env!("KIRBY_VZ_HELPER");
@@ -192,6 +201,9 @@ impl SandboxBackend for VzBackend {
             temp_kernel,
             temp_rootfs,
             exited: None,
+            // The vsock-only topology IS the egress lockdown; expose the honest
+            // no-NIC membrane when the guest asked for it.
+            egress: spec.lockdown_egress.then(VzVsockEgress::new),
         }))
     }
 
@@ -219,6 +231,41 @@ pub(crate) struct BootedVzVm {
     temp_kernel: Option<PathBuf>,
     temp_rootfs: Option<PathBuf>,
     exited: Option<ExitStatus>,
+    /// The egress membrane handle, present iff the guest was booted with
+    /// `lockdown_egress`. On VZ the membrane is the absence of a NIC (see
+    /// [`VzVsockEgress`]); this is `None` for a guest booted without lockdown.
+    egress: Option<VzVsockEgress>,
+}
+
+/// The VZ egress membrane as the backend-neutral [`EgressControl`] (gate G4, macOS).
+///
+/// VACUOUS-TRUE membrane: the VZ guest is vsock-only. The Swift helper configures NO
+/// `VZVirtioNetworkDevice`, so there is structurally no egress path off-box. Unlike
+/// the Firecracker TAP + nftables default-deny + eBPF byte meter, there is no NIC to
+/// lock down and no dropped packets to count. The proof of lockdown is "there is no
+/// NIC", not a non-zero drop counter: `iface_name()` is `"none"` and `drop_counter()`
+/// is always zero. This is a stronger membrane than default-deny (no path exists at
+/// all), but it cannot be DEMONSTRATED the way the Firecracker counter demonstrates a
+/// drop. Named plainly, not hidden.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct VzVsockEgress;
+
+impl VzVsockEgress {
+    fn new() -> Self {
+        VzVsockEgress
+    }
+}
+
+impl EgressControl for VzVsockEgress {
+    fn iface_name(&self) -> &str {
+        // No egress NIC exists on a vsock-only VZ guest; there is nothing to meter.
+        "none"
+    }
+
+    fn drop_counter(&self) -> EgressDropCounter {
+        // Vacuously zero: with no NIC there is no packet to drop.
+        EgressDropCounter::default()
+    }
 }
 
 #[async_trait::async_trait]
@@ -255,8 +302,9 @@ impl SandboxInstance for BootedVzVm {
         }
     }
 
-    fn egress_control(&self) -> Option<&dyn crate::sandbox::EgressControl> {
-        None
+    fn egress_control(&self) -> Option<&dyn EgressControl> {
+        // Some iff booted with lockdown_egress: the vsock-only/no-NIC membrane (G4).
+        self.egress.as_ref().map(|e| e as &dyn EgressControl)
     }
 
     fn stream_console(&mut self) {
@@ -309,11 +357,10 @@ fn validate_vz_boot_spec(spec: &GuestSpec) -> anyhow::Result<()> {
             "VZ does not support Kirby VM-snapshot resume; boot with snapshot_capable=false and use app checkpoints"
         );
     }
-    if spec.lockdown_egress {
-        anyhow::bail!(
-            "VZ egress lockdown is not implemented yet; first Mac milestone is vsock-only cold boot"
-        );
-    }
+    // `lockdown_egress` is satisfied STRUCTURALLY on VZ: the guest is vsock-only
+    // (no VZVirtioNetworkDevice), so there is no egress path to lock down. The
+    // booted instance exposes this via an honest no-NIC `EgressControl`
+    // (see [`VzVsockEgress`]). No validation gate is needed.
     if !spec.image.kernel.is_file() {
         anyhow::bail!(
             "VZ kernel image not found at {}",
