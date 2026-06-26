@@ -164,6 +164,41 @@ G1 PASS: VM Running=true ; GetSessionContext round-trip ; hello event detail="se
 The boot log also showed `backend="vz"`, `KIRBY_VZ_READY`, and a VZ helper exit
 status of 0 after daemon-initiated halt.
 
+## App-Checkpoint Resume (Portable, VZ-Verified)
+
+The portable app-checkpoint resume path (the macOS failover mechanism, since no VM
+memory snapshot crosses the backend boundary) is verified on VZ. It needs no
+VZ-specific backend code: resume lives above the `SandboxBackend` seam in the
+gateway and genome (`boot.rs` wires `BootConfig.restore_checkpoint` into
+`GatewayService::with_restore_checkpoint`, delivered to the genome via
+`GetSessionContext`), so the backend only does an ordinary `boot()`. The existing
+cross-backend test drives the full round-trip on whichever backend the platform
+resolves, which is VZ on this Mac:
+
+```bash
+KIRBY_GENOME_IMAGE=/absolute/path/to/kirby-genome-image-aarch64 \
+  nix develop -c cargo test -p kirby-node --release \
+    --test app_checkpoint_resume -- --nocapture
+```
+
+Verified result (both the positive handoff and the negative control pass):
+
+```text
+APP-CHECKPOINT PASS: node1_running=true first_checkpoint_ref=7612b679...:57
+  store_round_trip=true node1_halted=true node2_running=true restore_seen=true
+  fingerprint_pre=e8d1cc11... fingerprint_post=72288889... fingerprints_equal=false
+  entropy_call_before_restore_act=true
+```
+
+This proves on VZ: node1 boots, submits a logical checkpoint, and halts; node2
+boots a FRESH VZ guest with that checkpoint in `GetSessionContext` and rehydrates;
+and the resumed genome redraws a fresh entropy nonce (`fingerprint_pre` differs
+from `fingerprint_post`, the G7-sibling invariant). The negative control reuses a
+checkpoint-smuggled nonce and is correctly detected (`fingerprints_equal=true`), so
+the fresh-nonce check has teeth. The two nodes boot sequentially (node1 halts before
+node2) on distinct guest CIDs and gateway ports, with no VZ helper or socket
+contention.
+
 ## Machine-Specific Assumptions And Open Items
 
 - **Apple Silicon only:** The Mac path currently requires `target_arch = aarch64`.
