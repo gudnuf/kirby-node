@@ -615,7 +615,9 @@ async fn reconcile_fleet_on_startup(
     use anyhow::Context as _;
     use nostr_sdk::prelude::*;
 
-    use kirby_node::fleet_reconcile::{LeaseSnapshot, OrphanLivenessProbe, ProcLivenessProbe};
+    use kirby_node::fleet_reconcile::{
+        LeaseObservation, LeaseSnapshot, OrphanLivenessProbe, ProcLivenessProbe,
+    };
     use kirby_node::relay_lease::FleetLeaseObserver;
     use kirby_proto::KIND_KIRBY_LEASE;
 
@@ -634,25 +636,50 @@ async fn reconcile_fleet_on_startup(
         .with_context(|| format!("add fleet relay {relay_url} for reconcile lease observe"))?;
     client.connect().await;
     let filter = Filter::new().kind(Kind::from(KIND_KIRBY_LEASE));
-    client
+    // Capture the subscription id so we recognise THIS subscription's EOSE.
+    let sub = client
         .subscribe(filter, None)
         .await
         .context("subscribe to KIND_KIRBY_LEASE for reconcile")?;
+    let sub_id = sub.val;
 
-    // Drain the retained leases for a brief settle window (the relay delivers the latest
-    // addressable lease per agent on connect; a few seconds is enough to learn the fleet's current
-    // occupancy without holding up startup). Each observed lease folds into the occupancy view.
+    // THE FALSE-REAP FENCE (drain the RETAINED leases, then WAIT FOR EOSE — not a fixed timer).
+    // The relay sends every RETAINED (stored) lease and then an EOSE ("end of stored events");
+    // until that EOSE lands, an ABSENT lease might just be a not-yet-delivered retained event, NOT
+    // a dead agent. A reap is DESTRUCTIVE (kills the VM + DELETES the keystore = the agent's FROST
+    // identity), so we must NOT trust absence until the observation is CONFIRMED COMPLETE. We fold
+    // each observed lease into the occupancy view and stop on EOSE; a bounded backstop timeout
+    // guards against a relay that is reachable but slow / never sends EOSE — in which case the
+    // observation stays INCOMPLETE and the reconcile fails SAFE (skips) below.
     let mut notifications = client.notifications();
-    let settle = tokio::time::sleep(Duration::from_secs(3));
-    tokio::pin!(settle);
+    let backstop = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(backstop);
+    let mut eose_received = false;
     loop {
         tokio::select! {
-            _ = &mut settle => break,
+            _ = &mut backstop => {
+                // Reachable-but-slow / no EOSE: leave `eose_received = false` => fail safe below.
+                tracing::warn!(
+                    relay = relay_url,
+                    "FLEET reconcile: lease observation backstop elapsed WITHOUT an EOSE; the \
+                     retained-lease snapshot is INCOMPLETE so it cannot be trusted for absence"
+                );
+                break;
+            }
             notif = notifications.recv() => match notif {
                 Ok(RelayPoolNotification::Event { event, .. }) => {
                     if event.kind.as_u16() == KIND_KIRBY_LEASE {
                         observer.observe_occupancy(&event).await;
                     }
+                }
+                // EOSE for OUR subscription: the relay has delivered every retained lease — the
+                // snapshot is now AUTHORITATIVE. Stop draining; absence now genuinely means gone.
+                Ok(RelayPoolNotification::Message {
+                    message: RelayMessage::EndOfStoredEvents(id),
+                    ..
+                }) if *id == sub_id => {
+                    eose_received = true;
+                    break;
                 }
                 Ok(RelayPoolNotification::Shutdown) | Err(_) => break,
                 Ok(_) => {}
@@ -674,12 +701,20 @@ async fn reconcile_fleet_on_startup(
     // Done observing; drop the reconcile client (the control-plane loop opens its own).
     let _ = client.shutdown().await;
 
-    // Execute the decision: re-adopt healthy orphans, reap the rest, clearing reaped ledger
-    // entries through the SAME ledger handle the control-plane loop uses.
+    // Execute the decision GUARDED by observation completeness: re-adopt healthy orphans + reap
+    // the rest ONLY if EOSE confirmed the snapshot is complete; otherwise FAIL SAFE (skip — never
+    // reap an alive agent on unconfirmed lease data). Reaped ledger entries clear through the SAME
+    // ledger handle the control-plane loop uses.
+    let obs = if eose_received { LeaseObservation::Complete } else { LeaseObservation::Incomplete };
     let probe: Arc<dyn OrphanLivenessProbe> = Arc::new(ProcLivenessProbe);
-    let summary = supervisor.apply_reconcile(probe, &snapshot, Some(ledger));
+    let summary = supervisor.apply_reconcile(probe, &snapshot, obs, Some(ledger));
 
-    if summary.is_empty() {
+    if summary.skipped_unconfirmed {
+        println!(
+            "FLEET reconcile: SKIPPED (fail-safe) — no EOSE from the relay, so the lease snapshot \
+             was incomplete; orphans left running, a later restart with a healthy relay reconciles them"
+        );
+    } else if summary.is_empty() {
         println!("FLEET reconcile: nothing to reconcile (no live orphans found for the persisted set)");
     } else {
         for agent_id in &summary.readopted {
